@@ -14,7 +14,23 @@ GOVC_PASSWORD=secret \
 
 Flags (each falls back to the env var): `-url` (`GOVC_URL`), `-username` (`GOVC_USERNAME`),
 `-password` (`GOVC_PASSWORD`), `-interval` (seconds), `-mocking` (`GOVC_MOCKING=1`,
-runs against an in-process vCenter simulator for local testing).
+runs against an in-process vCenter simulator for local testing),
+`-exclude-vm-folders` (`GOVC_EXCLUDE_VM_FOLDERS`).
+
+### Excluding VMs by folder
+
+Site Recovery Manager placeholder VMs are recovery stubs that reserve no real
+capacity, but vSphere does not mark them as templates, so by default they inflate
+the allocation metrics. Pass the folder names they live in to leave them out:
+
+```sh
+./vsphere-exporter -exclude-vm-folders 'IT-Notfall'
+```
+
+The value is a comma separated list of folder *names*, matched across the whole
+inventory. A VM is skipped when it sits in a matching folder or in any subfolder
+below one. Names that match no folder are logged as a warning and otherwise
+ignored, so a renamed or not-yet-created folder never breaks a scrape.
 
 Development commands are in the `justfile` (`just test`, `just build`, `just run-mock`, `just metrics`).
 
@@ -27,8 +43,8 @@ Development commands are in the `justfile` (`just test`, `just build`, `just run
 | `vcenter_cluster_cpu_cores_total` | Physical CPU cores of all hosts |
 | `vcenter_cluster_cpu_mhz_total` | Total CPU capacity in MHz |
 | `vcenter_cluster_memory_bytes_total` | Total memory capacity |
-| `vcenter_cluster_vm_cpu_cores_allocated` | Sum of configured vCPUs of all VMs, powered-off included |
-| `vcenter_cluster_vm_memory_bytes_allocated` | Sum of configured VM memory, powered-off included |
+| `vcenter_cluster_vm_cpu_cores_allocated` | Sum of configured vCPUs of all VMs, powered-off included, excluded folders left out |
+| `vcenter_cluster_vm_memory_bytes_allocated` | Sum of configured VM memory, powered-off included, excluded folders left out |
 | `vcenter_cluster_cpu_cores_available` | Cores left after HA reserve and VM allocation |
 | `vcenter_cluster_memory_bytes_available` | Memory left after HA reserve and VM allocation |
 | `vcenter_datastore_capacity_bytes` | Datastore capacity |

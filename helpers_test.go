@@ -6,6 +6,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
+	"github.com/vmware/govmomi/object"
+	"github.com/vmware/govmomi/property"
 	"github.com/vmware/govmomi/view"
 	"github.com/vmware/govmomi/vim25"
 	"github.com/vmware/govmomi/vim25/mo"
@@ -80,6 +82,75 @@ func clusterHostStats(t *testing.T, ctx context.Context, client *vim25.Client) h
 		}
 	}
 	return stats
+}
+
+// countedVm is a VM that clusterVmAllocation actually counts, together with its
+// configured size and its parent folder.
+type countedVm struct {
+	Ref    types.ManagedObjectReference
+	Parent types.ManagedObjectReference
+	Cores  float64
+	Memory float64
+}
+
+// firstCountedVm returns the first cluster VM that contributes to the
+// allocation gauges, i.e. neither a template nor one with an unpopulated
+// config, mirroring the skip rules of clusterVmAllocation.
+func firstCountedVm(t *testing.T, ctx context.Context, client *vim25.Client) countedVm {
+	t.Helper()
+
+	refs := clusterVmRefs(t, ctx, client)
+	if len(refs) == 0 {
+		t.Fatal("no vms in cluster")
+	}
+
+	var vms []mo.VirtualMachine
+	if err := property.DefaultCollector(client).Retrieve(ctx, refs, []string{"summary.config", "parent"}, &vms); err != nil {
+		t.Fatalf("retrieving vms: %v", err)
+	}
+
+	for _, vm := range vms {
+		if vm.Summary.Config.Template || vm.Summary.Config.NumCpu == 0 {
+			continue
+		}
+		if vm.Parent == nil {
+			continue
+		}
+		return countedVm{
+			Ref:    vm.Reference(),
+			Parent: *vm.Parent,
+			Cores:  float64(vm.Summary.Config.NumCpu),
+			Memory: float64(int64(vm.Summary.Config.MemorySizeMB) * 1024 * 1024),
+		}
+	}
+
+	t.Fatal("no counted vm with a parent folder in cluster")
+	return countedVm{}
+}
+
+// createChildFolder creates a folder below the given parent folder.
+func createChildFolder(t *testing.T, ctx context.Context, client *vim25.Client, parent types.ManagedObjectReference, name string) *object.Folder {
+	t.Helper()
+
+	folder, err := object.NewFolder(client, parent).CreateFolder(ctx, name)
+	if err != nil {
+		t.Fatalf("creating folder %q: %v", name, err)
+	}
+	return folder
+}
+
+// moveVmInto moves the VM into the given folder, which is how SRM placeholder
+// VMs end up in their own folder.
+func moveVmInto(t *testing.T, ctx context.Context, folder *object.Folder, vm countedVm) {
+	t.Helper()
+
+	task, err := folder.MoveInto(ctx, []types.ManagedObjectReference{vm.Ref})
+	if err != nil {
+		t.Fatalf("moving vm into folder: %v", err)
+	}
+	if err := task.Wait(ctx); err != nil {
+		t.Fatalf("waiting for move into folder: %v", err)
+	}
 }
 
 // clusterVmRefs returns the VM references inside the simulator cluster.

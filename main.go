@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -14,11 +15,12 @@ import (
 const listenAddress = ":2112"
 
 var (
-	vcUsername    string
-	vcPassword    string
-	vcUrl         string
-	enableMocking bool
-	fetchInterval int64
+	vcUsername       string
+	vcPassword       string
+	vcUrl            string
+	enableMocking    bool
+	fetchInterval    int64
+	excludeVmFolders string
 )
 
 func init() {
@@ -27,6 +29,20 @@ func init() {
 	flag.StringVar(&vcUrl, "url", os.Getenv("GOVC_URL"), "URL for vCenter connection")
 	flag.Int64Var(&fetchInterval, "interval", 30, "Interval in seconds in which data will be fetched")
 	flag.BoolVar(&enableMocking, "mocking", os.Getenv("GOVC_MOCKING") == "1", "Enable vCenter mocking")
+	flag.StringVar(&excludeVmFolders, "exclude-vm-folders", os.Getenv("GOVC_EXCLUDE_VM_FOLDERS"),
+		"Comma-separated folder names whose VMs, including those in subfolders, are excluded from the cluster allocation metrics (e.g. SRM placeholder folders)")
+}
+
+// splitCommaList splits a comma separated flag value into trimmed, non-empty
+// entries. An empty or blank value yields nil.
+func splitCommaList(value string) []string {
+	var entries []string
+	for _, entry := range strings.Split(value, ",") {
+		if trimmed := strings.TrimSpace(entry); trimmed != "" {
+			entries = append(entries, trimmed)
+		}
+	}
+	return entries
 }
 
 func main() {
@@ -48,8 +64,13 @@ func main() {
 		fetchInterval = 30
 	}
 
+	excludedFolders := splitCommaList(excludeVmFolders)
+	if len(excludedFolders) > 0 {
+		slog.Info("excluding vms by folder", "folders", excludedFolders)
+	}
+
 	datastoreMetricsLoop(ctx, client.Client, fetchInterval, newDatastoreMetrics(prometheus.DefaultRegisterer))
-	clusterMetricsLoop(ctx, client.Client, fetchInterval, newClusterMetrics(prometheus.DefaultRegisterer))
+	clusterMetricsLoop(ctx, client.Client, fetchInterval, newClusterMetrics(prometheus.DefaultRegisterer), excludedFolders)
 
 	http.Handle("/metrics", promhttp.Handler())
 	slog.Info("listening", "address", listenAddress)
