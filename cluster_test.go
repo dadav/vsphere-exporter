@@ -1,14 +1,230 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/simulator"
 	"github.com/vmware/govmomi/vim25"
+	"github.com/vmware/govmomi/vim25/mo"
+	"github.com/vmware/govmomi/vim25/types"
 )
+
+func TestClassifyVmAllocation(t *testing.T) {
+	excludedFolder := types.ManagedObjectReference{Type: "Folder", Value: "group-v42"}
+
+	configuredVm := func() mo.VirtualMachine {
+		var vm mo.VirtualMachine
+		vm.Summary.Config.NumCpu = 2
+		vm.Summary.Config.MemorySizeMB = 4096
+		return vm
+	}
+
+	tests := []struct {
+		name         string
+		vm           mo.VirtualMachine
+		excluded     map[types.ManagedObjectReference]string
+		wantCounted  bool
+		wantReason   string
+		wantExcluded string
+	}{
+		{
+			name:        "included",
+			vm:          configuredVm(),
+			wantCounted: true,
+			wantReason:  vmAllocationReasonIncluded,
+		},
+		{
+			name: "template",
+			vm: func() mo.VirtualMachine {
+				vm := configuredVm()
+				vm.Summary.Config.Template = true
+				return vm
+			}(),
+			wantReason: vmAllocationReasonTemplate,
+		},
+		{
+			name:       "unpopulated config",
+			vm:         mo.VirtualMachine{},
+			wantReason: vmAllocationReasonUnpopulatedConfig,
+		},
+		{
+			name: "excluded folder",
+			vm: func() mo.VirtualMachine {
+				vm := configuredVm()
+				vm.Parent = &excludedFolder
+				return vm
+			}(),
+			excluded:     map[types.ManagedObjectReference]string{excludedFolder: "IT-Notfall"},
+			wantReason:   vmAllocationReasonExcludedFolder,
+			wantExcluded: "IT-Notfall",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			counted, reason, excludedBy := classifyVmAllocation(tc.vm, tc.excluded)
+			if counted != tc.wantCounted || reason != tc.wantReason || excludedBy != tc.wantExcluded {
+				t.Errorf("classifyVmAllocation() = (%v, %q, %q), want (%v, %q, %q)",
+					counted, reason, excludedBy, tc.wantCounted, tc.wantReason, tc.wantExcluded)
+			}
+		})
+	}
+}
+
+func TestClusterDebugDiagnostics(t *testing.T) {
+	simulator.Test(func(ctx context.Context, client *vim25.Client) {
+		var output bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		metrics := newClusterMetrics(prometheus.NewRegistry())
+
+		if err := collectClusterMetricsWithDebug(ctx, client, metrics, nil, logger); err != nil {
+			t.Fatalf("collectClusterMetricsWithDebug: %v", err)
+		}
+
+		logs := output.String()
+		vmCount := len(clusterVmRefs(t, ctx, client))
+		if got := strings.Count(logs, `msg="vm allocation decision"`); got != vmCount {
+			t.Errorf("VM decision records = %d, want %d\n%s", got, vmCount, logs)
+		}
+		for _, fragment := range []string{
+			`cluster=` + simulatorClusterName,
+			`power_state=poweredOn`,
+			`counted=true`,
+			`reason=included`,
+			`msg="cluster capacity calculation"`,
+			`complete=true`,
+			`cpu_ha_reserve_host=`,
+			`memory_ha_reserve_host=`,
+			fmt.Sprintf("vm_cpu_cores_allocated=%d", int64(gaugeValue(t, metrics.vmCpuCores, simulatorClusterName))),
+			fmt.Sprintf("vm_memory_bytes_allocated=%d", int64(gaugeValue(t, metrics.vmMemory, simulatorClusterName))),
+			fmt.Sprintf("memory_bytes_available=%d", int64(gaugeValue(t, metrics.memoryAvail, simulatorClusterName))),
+			fmt.Sprintf("cpu_cores_total=%d", int64(gaugeValue(t, metrics.cpuCoresTotal, simulatorClusterName))),
+			fmt.Sprintf("cpu_cores_available=%d", int64(gaugeValue(t, metrics.cpuCoresAvail, simulatorClusterName))),
+			fmt.Sprintf("memory_bytes_total=%d", int64(gaugeValue(t, metrics.memoryTotal, simulatorClusterName))),
+		} {
+			if !strings.Contains(logs, fragment) {
+				t.Errorf("debug output missing %q\n%s", fragment, logs)
+			}
+		}
+	})
+}
+
+// TestLogClusterCalculationIncomplete pins the rule that an aborted calculation
+// reports the values that were already computed. Reporting placeholder zeros
+// here would make the debug record contradict the exported gauges.
+func TestLogClusterCalculationIncomplete(t *testing.T) {
+	var output bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	logClusterCalculation(logger, clusterCalculation{
+		cluster:          "DC0_C9",
+		reason:           "no_hosts",
+		allocation:       vmAllocation{cpuCores: 4, memoryBytes: 8192, totalVMs: 3, countedVMs: 2, skippedVMs: 1},
+		memoryBytesTotal: 12345,
+	})
+
+	logs := output.String()
+	for _, fragment := range []string{
+		`cluster=DC0_C9`,
+		`complete=false`,
+		`reason=no_hosts`,
+		`memory_bytes_total=12345`,
+		`vm_cpu_cores_allocated=4`,
+		`vm_memory_bytes_allocated=8192`,
+		`vms_total=3`,
+		`vms_counted=2`,
+		`vms_skipped=1`,
+	} {
+		if !strings.Contains(logs, fragment) {
+			t.Errorf("debug output missing %q\n%s", fragment, logs)
+		}
+	}
+}
+
+// TestClusterDebugDiagnosticsWithoutHosts checks that a cluster whose
+// calculation aborts still produces a record, and that the record agrees with
+// the gauges that were exported for it.
+func TestClusterDebugDiagnosticsWithoutHosts(t *testing.T) {
+	const emptyCluster = "DC0_C9"
+
+	simulator.Test(func(ctx context.Context, client *vim25.Client) {
+		createEmptyCluster(t, ctx, client, emptyCluster)
+
+		var output bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		metrics := newClusterMetrics(prometheus.NewRegistry())
+
+		if err := collectClusterMetricsWithDebug(ctx, client, metrics, nil, logger); err != nil {
+			t.Fatalf("collectClusterMetricsWithDebug: %v", err)
+		}
+
+		record := calculationRecordFor(t, output.String(), emptyCluster)
+		for _, fragment := range []string{
+			`complete=false`,
+			`reason=no_hosts`,
+			fmt.Sprintf("memory_bytes_total=%d", int64(gaugeValue(t, metrics.memoryTotal, emptyCluster))),
+			fmt.Sprintf("vm_cpu_cores_allocated=%d", int64(gaugeValue(t, metrics.vmCpuCores, emptyCluster))),
+		} {
+			if !strings.Contains(record, fragment) {
+				t.Errorf("record for %s missing %q\n%s", emptyCluster, fragment, record)
+			}
+		}
+	})
+}
+
+// calculationRecordFor returns the single capacity calculation line of the
+// given cluster, so assertions cannot accidentally match another cluster.
+func calculationRecordFor(t *testing.T, logs, cluster string) string {
+	t.Helper()
+
+	for _, line := range strings.Split(logs, "\n") {
+		if strings.Contains(line, `msg="cluster capacity calculation"`) && strings.Contains(line, "cluster="+cluster+" ") {
+			return line
+		}
+	}
+
+	t.Fatalf("no capacity calculation record for cluster %q\n%s", cluster, logs)
+	return ""
+}
+
+// TestClusterDebugDiagnosticsSkippedVm checks that a VM which does not count
+// towards the allocation still shows up in the debug output, with the reason it
+// was skipped and the folder that caused it.
+func TestClusterDebugDiagnosticsSkippedVm(t *testing.T) {
+	const excludedFolder = "IT-Notfall"
+
+	simulator.Test(func(ctx context.Context, client *vim25.Client) {
+		vm := firstCountedVm(t, ctx, client)
+		folder := createChildFolder(t, ctx, client, vm.Parent, excludedFolder)
+		moveVmInto(t, ctx, folder, vm)
+
+		var output bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		metrics := newClusterMetrics(prometheus.NewRegistry())
+
+		if err := collectClusterMetricsWithDebug(ctx, client, metrics, []string{excludedFolder}, logger); err != nil {
+			t.Fatalf("collectClusterMetricsWithDebug: %v", err)
+		}
+
+		logs := output.String()
+		for _, fragment := range []string{
+			`counted=false reason=` + vmAllocationReasonExcludedFolder + ` excluded_by_folder=` + excludedFolder,
+			`vms_skipped=1`,
+			fmt.Sprintf("vms_total=%d", len(clusterVmRefs(t, ctx, client))),
+		} {
+			if !strings.Contains(logs, fragment) {
+				t.Errorf("debug output missing %q\n%s", fragment, logs)
+			}
+		}
+	})
+}
 
 func TestCollectClusterMetrics(t *testing.T) {
 	simulator.Test(func(ctx context.Context, client *vim25.Client) {

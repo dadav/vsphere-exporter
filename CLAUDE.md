@@ -20,6 +20,15 @@ Single test: `go test -run TestCollectClusterMetrics ./...`
 
 Connection to a real vCenter comes from flags or env: `GOVC_URL`, `GOVC_USERNAME`, `GOVC_PASSWORD` (`GOVC_MOCKING=1` or `-mocking` for simulator mode).
 
+`-debug` (`GOVC_DEBUG=1`, `just run-debug` against the simulator) is a one-shot
+cluster calculation mode. It uses an isolated Prometheus registry, emits
+structured VM decisions and capacity formula inputs, then exits without starting
+scrape loops or an HTTP listener. Keep its diagnostics on the same collection
+path as the exported cluster metrics. Every field of the capacity record is
+filled in where its value is computed (`clusterCalculation` in `cluster.go`), so
+an aborted calculation still reports the values that were exported instead of
+placeholder zeros, and a debug record never contradicts a gauge.
+
 ## Layout
 
 Flat package `main`, one file per feature so each can be regenerated on its own:

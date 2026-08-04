@@ -15,7 +15,24 @@ GOVC_PASSWORD=secret \
 Flags (each falls back to the env var): `-url` (`GOVC_URL`), `-username` (`GOVC_USERNAME`),
 `-password` (`GOVC_PASSWORD`), `-interval` (seconds), `-mocking` (`GOVC_MOCKING=1`,
 runs against an in-process vCenter simulator for local testing),
-`-exclude-vm-folders` (`GOVC_EXCLUDE_VM_FOLDERS`).
+`-exclude-vm-folders` (`GOVC_EXCLUDE_VM_FOLDERS`), and `-debug`
+(`GOVC_DEBUG=1`).
+
+### Debugging cluster calculations
+
+Use `-debug` or `GOVC_DEBUG=1` to run one cluster collection, print structured
+calculation diagnostics to stderr, and exit:
+
+```sh
+./vsphere-exporter -debug
+```
+
+Debug mode does not start the background collection loops, open port `2112`, or
+expose metrics. It prints one decision for every VM in each cluster, including
+whether the VM was counted and why it was skipped. It also prints the complete
+CPU and memory calculation with cluster totals, largest-host HA reserves, VM
+allocations, and available capacity. `-exclude-vm-folders` is honoured, and
+powered-off VMs are shown and counted normally.
 
 ### Excluding VMs by folder
 

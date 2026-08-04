@@ -128,6 +128,31 @@ func firstCountedVm(t *testing.T, ctx context.Context, client *vim25.Client) cou
 	return countedVm{}
 }
 
+// createEmptyCluster creates a compute cluster without any hosts, the inventory
+// shape that makes the capacity calculation abort after the VM allocation.
+func createEmptyCluster(t *testing.T, ctx context.Context, client *vim25.Client, name string) {
+	t.Helper()
+
+	viewManager := view.NewManager(client)
+	datacenterView, err := viewManager.CreateContainerView(ctx, client.ServiceContent.RootFolder, []string{"Datacenter"}, true)
+	if err != nil {
+		t.Fatalf("creating datacenter view: %v", err)
+	}
+	defer datacenterView.Destroy(ctx)
+
+	var datacenters []mo.Datacenter
+	if err := datacenterView.Retrieve(ctx, []string{"Datacenter"}, []string{"hostFolder"}, &datacenters); err != nil {
+		t.Fatalf("retrieving datacenters: %v", err)
+	}
+	if len(datacenters) == 0 {
+		t.Fatal("no datacenter found")
+	}
+
+	if _, err := object.NewFolder(client, datacenters[0].HostFolder).CreateCluster(ctx, name, types.ClusterConfigSpecEx{}); err != nil {
+		t.Fatalf("creating cluster %q: %v", name, err)
+	}
+}
+
 // createChildFolder creates a folder below the given parent folder.
 func createChildFolder(t *testing.T, ctx context.Context, client *vim25.Client, parent types.ManagedObjectReference, name string) *object.Folder {
 	t.Helper()

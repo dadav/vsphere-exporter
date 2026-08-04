@@ -1,10 +1,12 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -15,6 +17,44 @@ import (
 	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/types"
 )
+
+const (
+	vmAllocationReasonIncluded          = "included"
+	vmAllocationReasonTemplate          = "template"
+	vmAllocationReasonUnpopulatedConfig = "unpopulated_config"
+	vmAllocationReasonExcludedFolder    = "excluded_folder"
+)
+
+type vmAllocation struct {
+	cpuCores    int64
+	memoryBytes int64
+	totalVMs    int
+	countedVMs  int
+	skippedVMs  int
+}
+
+// clusterCalculation captures the inputs of the cluster capacity formulas so
+// debug mode explains exactly the numbers that were exported. Fields are filled
+// in as they are computed, so the record of an aborted calculation carries
+// everything known up to that point and zero for the rest. complete says
+// whether all gauges of the cluster were exported, reason names the step that
+// stopped it.
+type clusterCalculation struct {
+	cluster    string
+	complete   bool
+	reason     string
+	allocation vmAllocation
+
+	cpuCoresTotal     int64
+	cpuReserveCores   int64
+	cpuReserveHost    string
+	cpuCoresAvailable int64
+
+	memoryBytesTotal     int64
+	memoryReserveBytes   int64
+	memoryReserveHost    string
+	memoryBytesAvailable int64
+}
 
 // clusterMetrics holds the compute cluster capacity gauges. All gauges are
 // labelled with the cluster name.
@@ -92,6 +132,15 @@ func (m *clusterMetrics) resetGauges() {
 }
 
 // collectClusterMetrics does a single scrape pass over all compute clusters.
+// It is the entry point of the scrape loop, debug diagnostics are off.
+func collectClusterMetrics(ctx context.Context, client *vim25.Client, metrics *clusterMetrics, excludedFolderNames []string) error {
+	return collectClusterMetricsWithDebug(ctx, client, metrics, excludedFolderNames, nil)
+}
+
+// collectClusterMetricsWithDebug does a single scrape pass over all compute
+// clusters. A non-nil debugLogger additionally emits one record per VM
+// allocation decision and one per cluster capacity calculation, so the exported
+// numbers can be explained without a second code path.
 //
 // Available resources are computed as:
 //
@@ -107,7 +156,7 @@ func (m *clusterMetrics) resetGauges() {
 //
 // Errors of individual clusters are collected and returned joined, so one
 // broken cluster neither aborts the pass nor stays invisible to the caller.
-func collectClusterMetrics(ctx context.Context, client *vim25.Client, metrics *clusterMetrics, excludedFolderNames []string) error {
+func collectClusterMetricsWithDebug(ctx context.Context, client *vim25.Client, metrics *clusterMetrics, excludedFolderNames []string, debugLogger *slog.Logger) error {
 	viewManager := view.NewManager(client)
 
 	excludedFolders, err := resolveExcludedFolders(ctx, viewManager, client.ServiceContent.RootFolder, excludedFolderNames)
@@ -125,6 +174,9 @@ func collectClusterMetrics(ctx context.Context, client *vim25.Client, metrics *c
 	if err := clusterView.Retrieve(ctx, []string{"ClusterComputeResource"}, []string{"name", "summary", "host"}, &clusters); err != nil {
 		return fmt.Errorf("retrieving clusters: %w", err)
 	}
+	if debugLogger != nil {
+		sortByName(clusters, func(cluster mo.ClusterComputeResource) string { return cluster.Name })
+	}
 
 	propCollector := property.DefaultCollector(client)
 
@@ -134,7 +186,7 @@ func collectClusterMetrics(ctx context.Context, client *vim25.Client, metrics *c
 
 	var errs []error
 	for _, cluster := range clusters {
-		if err := collectOneCluster(ctx, viewManager, propCollector, cluster, excludedFolders, metrics); err != nil {
+		if err := collectOneCluster(ctx, viewManager, propCollector, cluster, excludedFolders, metrics, debugLogger); err != nil {
 			errs = append(errs, fmt.Errorf("cluster %q: %w", cluster.Name, err))
 		}
 	}
@@ -151,7 +203,7 @@ func collectClusterMetrics(ctx context.Context, client *vim25.Client, metrics *c
 // A name without any matching folder is logged and otherwise ignored, it is not
 // an error: the folder may not exist yet or may have been renamed, and that must
 // not stop the scrape.
-func resolveExcludedFolders(ctx context.Context, viewManager *view.Manager, root types.ManagedObjectReference, names []string) (map[types.ManagedObjectReference]bool, error) {
+func resolveExcludedFolders(ctx context.Context, viewManager *view.Manager, root types.ManagedObjectReference, names []string) (map[types.ManagedObjectReference]string, error) {
 	if len(names) == 0 {
 		return nil, nil
 	}
@@ -172,7 +224,7 @@ func resolveExcludedFolders(ctx context.Context, viewManager *view.Manager, root
 		return nil, fmt.Errorf("retrieving folders: %w", err)
 	}
 
-	excluded := make(map[types.ManagedObjectReference]bool)
+	excluded := make(map[types.ManagedObjectReference]string)
 	parents := make(map[types.ManagedObjectReference]types.ManagedObjectReference, len(folders))
 	for _, folder := range folders {
 		if folder.Parent != nil {
@@ -182,7 +234,7 @@ func resolveExcludedFolders(ctx context.Context, viewManager *view.Manager, root
 			continue
 		}
 		wanted[folder.Name] = true
-		excluded[folder.Reference()] = true
+		excluded[folder.Reference()] = folder.Name
 	}
 
 	// Expand to all descendant folders. Each iteration pulls in the folders
@@ -191,8 +243,11 @@ func resolveExcludedFolders(ctx context.Context, viewManager *view.Manager, root
 	for changed := true; changed; {
 		changed = false
 		for folder, parent := range parents {
-			if !excluded[folder] && excluded[parent] {
-				excluded[folder] = true
+			if _, alreadyExcluded := excluded[folder]; alreadyExcluded {
+				continue
+			}
+			if excludedBy, parentExcluded := excluded[parent]; parentExcluded {
+				excluded[folder] = excludedBy
 				changed = true
 			}
 		}
@@ -207,8 +262,9 @@ func resolveExcludedFolders(ctx context.Context, viewManager *view.Manager, root
 	return excluded, nil
 }
 
-func collectOneCluster(ctx context.Context, viewManager *view.Manager, propCollector *property.Collector, cluster mo.ClusterComputeResource, excludedFolders map[types.ManagedObjectReference]bool, metrics *clusterMetrics) error {
+func collectOneCluster(ctx context.Context, viewManager *view.Manager, propCollector *property.Collector, cluster mo.ClusterComputeResource, excludedFolders map[types.ManagedObjectReference]string, metrics *clusterMetrics, debugLogger *slog.Logger) error {
 	name := cluster.Name
+	calc := clusterCalculation{cluster: name}
 
 	var summary *types.ComputeResourceSummary
 	if cluster.Summary != nil {
@@ -217,35 +273,47 @@ func collectOneCluster(ctx context.Context, viewManager *view.Manager, propColle
 		metrics.hostsEffective.WithLabelValues(name).Set(float64(summary.NumEffectiveHosts))
 		metrics.cpuMhzTotal.WithLabelValues(name).Set(float64(summary.TotalCpu))
 		metrics.memoryTotal.WithLabelValues(name).Set(float64(summary.TotalMemory))
+		// Recorded here and not only on the complete path, so the debug record
+		// of an aborted calculation still matches the exported total.
+		calc.memoryBytesTotal = summary.TotalMemory
 	} else {
 		slog.Warn("cluster has no summary, skipping capacity totals", "cluster", name)
 	}
 
 	// Allocation does not depend on host data, so it is exported even for
 	// clusters without hosts.
-	vmCores, vmMemory, err := clusterVmAllocation(ctx, viewManager, cluster.Reference(), excludedFolders)
+	allocation, err := clusterVmAllocation(ctx, viewManager, cluster.Reference(), name, excludedFolders, debugLogger)
 	if err != nil {
 		return fmt.Errorf("retrieving vms: %w", err)
 	}
-	metrics.vmCpuCores.WithLabelValues(name).Set(float64(vmCores))
-	metrics.vmMemory.WithLabelValues(name).Set(float64(vmMemory))
+	calc.allocation = allocation
+	metrics.vmCpuCores.WithLabelValues(name).Set(float64(allocation.cpuCores))
+	metrics.vmMemory.WithLabelValues(name).Set(float64(allocation.memoryBytes))
 
 	if len(cluster.Host) == 0 {
+		calc.reason = "no_hosts"
+		logClusterCalculation(debugLogger, calc)
 		slog.Warn("cluster has no hosts, skipping available resources", "cluster", name)
 		return nil
 	}
 
 	var hosts []mo.HostSystem
-	if err := propCollector.Retrieve(ctx, cluster.Host, []string{"summary.hardware"}, &hosts); err != nil {
+	if err := propCollector.Retrieve(ctx, cluster.Host, []string{"name", "summary.hardware"}, &hosts); err != nil {
 		return fmt.Errorf("retrieving hosts: %w", err)
+	}
+	if debugLogger != nil {
+		sortByName(hosts, func(host mo.HostSystem) string { return host.Name })
 	}
 
 	// Largest host by cores and largest host by memory are tracked
 	// independently, which is the conservative HA reserve for
 	// heterogeneous clusters.
 	var totalCores, maxHostCores, maxHostMemory int64
+	var maxCoreHost, maxMemoryHost string
 	for _, host := range hosts {
 		if host.Summary.Hardware == nil {
+			calc.reason = "host_hardware_missing"
+			logClusterCalculation(debugLogger, calc)
 			// Incomplete hardware data (e.g. disconnected host) would make
 			// the core and available values silently wrong, so skip them
 			// entirely for this cluster instead of exporting bad numbers.
@@ -256,24 +324,40 @@ func collectOneCluster(ctx context.Context, viewManager *view.Manager, propColle
 		cores := int64(host.Summary.Hardware.NumCpuCores)
 		if cores > maxHostCores {
 			maxHostCores = cores
+			maxCoreHost = host.Name
 		}
 		totalCores += cores
 
 		if memory := host.Summary.Hardware.MemorySize; memory > maxHostMemory {
 			maxHostMemory = memory
+			maxMemoryHost = host.Name
 		}
 	}
 
+	calc.cpuCoresTotal = totalCores
+	calc.cpuReserveCores = maxHostCores
+	calc.cpuReserveHost = maxCoreHost
+	calc.cpuCoresAvailable = totalCores - maxHostCores - allocation.cpuCores
+	calc.memoryReserveBytes = maxHostMemory
+	calc.memoryReserveHost = maxMemoryHost
+
 	metrics.cpuCoresTotal.WithLabelValues(name).Set(float64(totalCores))
-	metrics.cpuCoresAvail.WithLabelValues(name).Set(float64(totalCores - maxHostCores - vmCores))
+	metrics.cpuCoresAvail.WithLabelValues(name).Set(float64(calc.cpuCoresAvailable))
 
 	// Available memory is derived from the same cluster summary value that is
 	// exported as the total, so both gauges stay consistent.
 	if summary == nil {
+		calc.reason = "cluster_summary_missing"
+		logClusterCalculation(debugLogger, calc)
 		slog.Warn("cluster has no summary, skipping available memory", "cluster", name)
 		return nil
 	}
-	metrics.memoryAvail.WithLabelValues(name).Set(float64(summary.TotalMemory - maxHostMemory - vmMemory))
+	calc.memoryBytesAvailable = summary.TotalMemory - maxHostMemory - allocation.memoryBytes
+	metrics.memoryAvail.WithLabelValues(name).Set(float64(calc.memoryBytesAvailable))
+
+	calc.complete = true
+	calc.reason = "complete"
+	logClusterCalculation(debugLogger, calc)
 
 	return nil
 }
@@ -284,37 +368,103 @@ func collectOneCluster(ctx context.Context, viewManager *view.Manager, propColle
 // excluded set already contains all descendant folders, so the direct parent
 // lookup covers subfolders too. Power state is deliberately ignored, so powered
 // off VMs count towards the allocation.
-func clusterVmAllocation(ctx context.Context, viewManager *view.Manager, cluster types.ManagedObjectReference, excludedFolders map[types.ManagedObjectReference]bool) (int64, int64, error) {
+func clusterVmAllocation(ctx context.Context, viewManager *view.Manager, cluster types.ManagedObjectReference, clusterName string, excludedFolders map[types.ManagedObjectReference]string, debugLogger *slog.Logger) (vmAllocation, error) {
 	vmView, err := viewManager.CreateContainerView(ctx, cluster, []string{"VirtualMachine"}, true)
 	if err != nil {
-		return 0, 0, fmt.Errorf("creating vm container view: %w", err)
+		return vmAllocation{}, fmt.Errorf("creating vm container view: %w", err)
 	}
 	defer vmView.Destroy(ctx)
 
 	var vms []mo.VirtualMachine
-	if err := vmView.Retrieve(ctx, []string{"VirtualMachine"}, []string{"summary.config", "parent"}, &vms); err != nil {
-		return 0, 0, err
+	properties := []string{"summary.config", "parent"}
+	if debugLogger != nil {
+		properties = append(properties, "name", "summary.runtime.powerState")
+	}
+	if err := vmView.Retrieve(ctx, []string{"VirtualMachine"}, properties, &vms); err != nil {
+		return vmAllocation{}, err
+	}
+	if debugLogger != nil {
+		sortByName(vms, func(vm mo.VirtualMachine) string { return vm.Name })
 	}
 
-	var cores, memory int64
+	allocation := vmAllocation{totalVMs: len(vms)}
 	for _, vm := range vms {
-		if vm.Summary.Config.Template {
+		counted, reason, excludedBy := classifyVmAllocation(vm, excludedFolders)
+		memoryBytes := int64(vm.Summary.Config.MemorySizeMB) * 1024 * 1024
+		if debugLogger != nil {
+			debugLogger.Debug("vm allocation decision",
+				"cluster", clusterName,
+				"vm", vm.Name,
+				"vm_ref", vm.Reference().Value,
+				"power_state", vm.Summary.Runtime.PowerState,
+				"cpu_cores", vm.Summary.Config.NumCpu,
+				"memory_mib", vm.Summary.Config.MemorySizeMB,
+				"memory_bytes", memoryBytes,
+				"counted", counted,
+				"reason", reason,
+				"excluded_by_folder", excludedBy)
+		}
+		if !counted {
+			allocation.skippedVMs++
 			continue
 		}
-		if vm.Summary.Config.NumCpu == 0 {
-			// Config not populated yet, e.g. VM currently being created.
-			continue
-		}
-		// The parent of a VM is its folder, the cluster membership comes from
-		// the resource pool, so an excluded folder does not hide the VM from
-		// the container view above.
-		if vm.Parent != nil && excludedFolders[*vm.Parent] {
-			continue
-		}
-		cores += int64(vm.Summary.Config.NumCpu)
-		memory += int64(vm.Summary.Config.MemorySizeMB) * 1024 * 1024
+		allocation.countedVMs++
+		allocation.cpuCores += int64(vm.Summary.Config.NumCpu)
+		allocation.memoryBytes += memoryBytes
 	}
-	return cores, memory, nil
+	return allocation, nil
+}
+
+func classifyVmAllocation(vm mo.VirtualMachine, excludedFolders map[types.ManagedObjectReference]string) (bool, string, string) {
+	if vm.Summary.Config.Template {
+		return false, vmAllocationReasonTemplate, ""
+	}
+	if vm.Summary.Config.NumCpu == 0 {
+		return false, vmAllocationReasonUnpopulatedConfig, ""
+	}
+	// The parent of a VM is its folder, while cluster membership comes from
+	// the resource pool. An excluded folder does not hide the VM from the view.
+	if vm.Parent != nil {
+		if excludedBy, excluded := excludedFolders[*vm.Parent]; excluded {
+			return false, vmAllocationReasonExcludedFolder, excludedBy
+		}
+	}
+	return true, vmAllocationReasonIncluded, ""
+}
+
+// sortByName gives debug output a stable order. The managed object reference
+// breaks ties between identically named objects, which vCenter allows across
+// datacenters and folders.
+func sortByName[T mo.Reference](items []T, name func(T) string) {
+	slices.SortFunc(items, func(a, b T) int {
+		return cmp.Or(
+			cmp.Compare(name(a), name(b)),
+			cmp.Compare(a.Reference().Value, b.Reference().Value),
+		)
+	})
+}
+
+func logClusterCalculation(logger *slog.Logger, calc clusterCalculation) {
+	if logger == nil {
+		return
+	}
+	logger.Debug("cluster capacity calculation",
+		"cluster", calc.cluster,
+		"complete", calc.complete,
+		"reason", calc.reason,
+		"vms_total", calc.allocation.totalVMs,
+		"vms_counted", calc.allocation.countedVMs,
+		"vms_skipped", calc.allocation.skippedVMs,
+		"cpu_cores_total", calc.cpuCoresTotal,
+		"cpu_ha_reserve_cores", calc.cpuReserveCores,
+		"cpu_ha_reserve_host", calc.cpuReserveHost,
+		"vm_cpu_cores_allocated", calc.allocation.cpuCores,
+		"cpu_cores_available", calc.cpuCoresAvailable,
+		"memory_bytes_total", calc.memoryBytesTotal,
+		"memory_ha_reserve_bytes", calc.memoryReserveBytes,
+		"memory_ha_reserve_host", calc.memoryReserveHost,
+		"vm_memory_bytes_allocated", calc.allocation.memoryBytes,
+		"memory_bytes_available", calc.memoryBytesAvailable)
 }
 
 func clusterMetricsLoop(ctx context.Context, client *vim25.Client, interval int64, metrics *clusterMetrics, excludedFolderNames []string) {
