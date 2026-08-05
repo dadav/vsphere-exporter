@@ -41,11 +41,28 @@ func TestClassifyVmAllocation(t *testing.T) {
 			wantReason:  vmAllocationReasonIncluded,
 		},
 		{
+			// Real deployments report "com.vmware.vcDr", not the "vcDR"
+			// casing some VMware docs use, so the match must be
+			// case-insensitive.
 			name: "srm placeholder",
 			vm: func() mo.VirtualMachine {
 				vm := configuredVm()
 				vm.Summary.Config.ManagedBy = &types.ManagedByInfo{
-					ExtensionKey: srmManagedByExtensionKey,
+					ExtensionKey: "com.vmware.vcDr",
+					Type:         srmPlaceholderVmType,
+				}
+				return vm
+			}(),
+			wantReason: vmAllocationReasonSrmPlaceholder,
+		},
+		{
+			// Shared recovery site SRM instances register suffixed
+			// extension keys, so the match is a prefix match.
+			name: "srm placeholder with suffixed extension key",
+			vm: func() mo.VirtualMachine {
+				vm := configuredVm()
+				vm.Summary.Config.ManagedBy = &types.ManagedByInfo{
+					ExtensionKey: "com.vmware.vcDr-29063a3f",
 					Type:         srmPlaceholderVmType,
 				}
 				return vm
@@ -57,7 +74,7 @@ func TestClassifyVmAllocation(t *testing.T) {
 			vm: func() mo.VirtualMachine {
 				vm := configuredVm()
 				vm.Summary.Config.ManagedBy = &types.ManagedByInfo{
-					ExtensionKey: srmManagedByExtensionKey,
+					ExtensionKey: "com.vmware.vcDr",
 					Type:         "testVm",
 				}
 				return vm
@@ -307,7 +324,7 @@ func TestClusterDebugDiagnosticsSkippedVm(t *testing.T) {
 func TestClusterDebugDiagnosticsSrmPlaceholderVm(t *testing.T) {
 	simulator.Test(func(ctx context.Context, client *vim25.Client) {
 		vm := firstCountedVm(t, ctx, client)
-		setVmManagedBy(t, ctx, client, vm, srmManagedByExtensionKey, srmPlaceholderVmType)
+		setVmManagedBy(t, ctx, client, vm, "com.vmware.vcDr", srmPlaceholderVmType)
 
 		var output bytes.Buffer
 		logger := slog.New(slog.NewTextHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -320,7 +337,7 @@ func TestClusterDebugDiagnosticsSrmPlaceholderVm(t *testing.T) {
 		logs := output.String()
 		for _, fragment := range []string{
 			`counted=false reason=` + vmAllocationReasonSrmPlaceholder,
-			`managed_by_extension=` + srmManagedByExtensionKey,
+			`managed_by_extension=com.vmware.vcDr`,
 			`managed_by_type=` + srmPlaceholderVmType,
 			`vms_skipped=1`,
 		} {
@@ -544,7 +561,7 @@ func TestSrmPlaceholderVmsNotCounted(t *testing.T) {
 		memoryBefore := gaugeValue(t, baseline.vmMemory, simulatorClusterName)
 
 		vm := firstCountedVm(t, ctx, client)
-		setVmManagedBy(t, ctx, client, vm, srmManagedByExtensionKey, srmPlaceholderVmType)
+		setVmManagedBy(t, ctx, client, vm, "com.vmware.vcDr-29063a3f", srmPlaceholderVmType)
 
 		assertVmExcluded(t, ctx, client, nil, vm, vcpusBefore, memoryBefore)
 	})

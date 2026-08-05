@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -19,7 +20,10 @@ import (
 )
 
 const (
-	srmManagedByExtensionKey            = "com.vmware.vcDR"
+	// SRM registers as "com.vmware.vcDr" (casing varies across deployments)
+	// and shared recovery site installs suffix it ("com.vmware.vcDr-<id>"),
+	// so detection is a case-insensitive prefix match, not equality.
+	srmManagedByExtensionKeyPrefix      = "com.vmware.vcdr"
 	srmPlaceholderVmType                = "placeholderVm"
 	vmAllocationReasonIncluded          = "included"
 	vmAllocationReasonSrmPlaceholder    = "srm_placeholder"
@@ -458,9 +462,13 @@ func clusterVmAllocation(ctx context.Context, viewManager *view.Manager, cluster
 	return allocation, nil
 }
 
+func isSrmExtensionKey(extensionKey string) bool {
+	return strings.HasPrefix(strings.ToLower(extensionKey), srmManagedByExtensionKeyPrefix)
+}
+
 func classifyVmAllocation(vm mo.VirtualMachine, excludedFolders map[types.ManagedObjectReference]string) (bool, string, string) {
 	managedBy := vm.Summary.Config.ManagedBy
-	if managedBy != nil && managedBy.ExtensionKey == srmManagedByExtensionKey && managedBy.Type == srmPlaceholderVmType {
+	if managedBy != nil && isSrmExtensionKey(managedBy.ExtensionKey) && managedBy.Type == srmPlaceholderVmType {
 		return false, vmAllocationReasonSrmPlaceholder, ""
 	}
 	if vm.Summary.Config.Template {
