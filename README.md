@@ -34,11 +34,17 @@ CPU and memory calculation with cluster totals, largest-host HA reserves, VM
 allocations, and available capacity. `-exclude-vm-folders` is honoured, and
 powered-off VMs are shown and counted normally.
 
+### SRM placeholder VMs
+
+Site Recovery Manager placeholder VMs are excluded automatically when vSphere
+reports `summary.config.managedBy.extensionKey` as `com.vmware.vcDR` and its
+type as `placeholderVm`. SRM recovery-test VMs with type `testVm` remain
+included because they can consume cluster capacity. No configuration is needed.
+
 ### Excluding VMs by folder
 
-Site Recovery Manager placeholder VMs are recovery stubs that reserve no real
-capacity, but vSphere does not mark them as templates, so by default they inflate
-the allocation metrics. Pass the folder names they live in to leave them out:
+Use the folder exclusion as an additional override for VMs that should not count
+towards allocation metrics but are not identifiable as SRM placeholders:
 
 ```sh
 ./vsphere-exporter -exclude-vm-folders 'IT-Notfall'
@@ -61,8 +67,8 @@ Development commands are in the `justfile` (`just test`, `just build`, `just run
 | `vcenter_cluster_cpu_threads_total` | Logical CPU threads of all hosts |
 | `vcenter_cluster_cpu_mhz_total` | Total CPU capacity in MHz |
 | `vcenter_cluster_memory_bytes_total` | Total memory capacity |
-| `vcenter_cluster_vm_vcpus_allocated` | Sum of configured vCPUs of all VMs, powered-off included, excluded folders left out |
-| `vcenter_cluster_vm_memory_bytes_allocated` | Sum of configured VM memory, powered-off included, excluded folders left out |
+| `vcenter_cluster_vm_vcpus_allocated` | Sum of configured vCPUs of all VMs, powered-off included, SRM placeholders and excluded folders left out |
+| `vcenter_cluster_vm_memory_bytes_allocated` | Sum of configured VM memory, powered-off included, SRM placeholders and excluded folders left out |
 | `vcenter_cluster_cpu_threads_available` | Logical CPU threads left after HA reserve and VM allocation |
 | `vcenter_cluster_memory_bytes_available` | Memory left after HA reserve and VM allocation |
 | `vcenter_datastore_capacity_bytes` | Datastore capacity |

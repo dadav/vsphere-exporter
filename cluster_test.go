@@ -41,6 +41,44 @@ func TestClassifyVmAllocation(t *testing.T) {
 			wantReason:  vmAllocationReasonIncluded,
 		},
 		{
+			name: "srm placeholder",
+			vm: func() mo.VirtualMachine {
+				vm := configuredVm()
+				vm.Summary.Config.ManagedBy = &types.ManagedByInfo{
+					ExtensionKey: srmManagedByExtensionKey,
+					Type:         srmPlaceholderVmType,
+				}
+				return vm
+			}(),
+			wantReason: vmAllocationReasonSrmPlaceholder,
+		},
+		{
+			name: "srm test vm remains included",
+			vm: func() mo.VirtualMachine {
+				vm := configuredVm()
+				vm.Summary.Config.ManagedBy = &types.ManagedByInfo{
+					ExtensionKey: srmManagedByExtensionKey,
+					Type:         "testVm",
+				}
+				return vm
+			}(),
+			wantCounted: true,
+			wantReason:  vmAllocationReasonIncluded,
+		},
+		{
+			name: "unrelated manager remains included",
+			vm: func() mo.VirtualMachine {
+				vm := configuredVm()
+				vm.Summary.Config.ManagedBy = &types.ManagedByInfo{
+					ExtensionKey: "example.extension",
+					Type:         srmPlaceholderVmType,
+				}
+				return vm
+			}(),
+			wantCounted: true,
+			wantReason:  vmAllocationReasonIncluded,
+		},
+		{
 			name: "template",
 			vm: func() mo.VirtualMachine {
 				vm := configuredVm()
@@ -254,9 +292,37 @@ func TestClusterDebugDiagnosticsSkippedVm(t *testing.T) {
 
 		logs := output.String()
 		for _, fragment := range []string{
-			`counted=false reason=` + vmAllocationReasonExcludedFolder + ` excluded_by_folder=` + excludedFolder,
+			`counted=false reason=` + vmAllocationReasonExcludedFolder,
+			`excluded_by_folder=` + excludedFolder,
 			`vms_skipped=1`,
 			fmt.Sprintf("vms_total=%d", len(clusterVmRefs(t, ctx, client))),
+		} {
+			if !strings.Contains(logs, fragment) {
+				t.Errorf("debug output missing %q\n%s", fragment, logs)
+			}
+		}
+	})
+}
+
+func TestClusterDebugDiagnosticsSrmPlaceholderVm(t *testing.T) {
+	simulator.Test(func(ctx context.Context, client *vim25.Client) {
+		vm := firstCountedVm(t, ctx, client)
+		setVmManagedBy(t, ctx, client, vm, srmManagedByExtensionKey, srmPlaceholderVmType)
+
+		var output bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		metrics := newClusterMetrics(prometheus.NewRegistry())
+
+		if err := collectClusterMetricsWithDebug(ctx, client, metrics, nil, logger); err != nil {
+			t.Fatalf("collectClusterMetricsWithDebug: %v", err)
+		}
+
+		logs := output.String()
+		for _, fragment := range []string{
+			`counted=false reason=` + vmAllocationReasonSrmPlaceholder,
+			`managed_by_extension=` + srmManagedByExtensionKey,
+			`managed_by_type=` + srmPlaceholderVmType,
+			`vms_skipped=1`,
 		} {
 			if !strings.Contains(logs, fragment) {
 				t.Errorf("debug output missing %q\n%s", fragment, logs)
@@ -465,6 +531,22 @@ func TestExcludedFolderVmsNotCounted(t *testing.T) {
 		if got := gaugeValue(t, unfiltered.vmMemory, simulatorClusterName); got != memoryBefore {
 			t.Errorf("vm_memory_bytes_allocated without exclusion = %v, want unchanged %v", got, memoryBefore)
 		}
+	})
+}
+
+func TestSrmPlaceholderVmsNotCounted(t *testing.T) {
+	simulator.Test(func(ctx context.Context, client *vim25.Client) {
+		baseline := newClusterMetrics(prometheus.NewRegistry())
+		if err := collectClusterMetrics(ctx, client, baseline, nil); err != nil {
+			t.Fatalf("collectClusterMetrics baseline: %v", err)
+		}
+		vcpusBefore := gaugeValue(t, baseline.vmVcpus, simulatorClusterName)
+		memoryBefore := gaugeValue(t, baseline.vmMemory, simulatorClusterName)
+
+		vm := firstCountedVm(t, ctx, client)
+		setVmManagedBy(t, ctx, client, vm, srmManagedByExtensionKey, srmPlaceholderVmType)
+
+		assertVmExcluded(t, ctx, client, nil, vm, vcpusBefore, memoryBefore)
 	})
 }
 

@@ -181,6 +181,23 @@ func moveVmInto(t *testing.T, ctx context.Context, folder *object.Folder, vm cou
 	}
 }
 
+func setVmManagedBy(t *testing.T, ctx context.Context, client *vim25.Client, vm countedVm, extensionKey, managedType string) {
+	t.Helper()
+
+	task, err := object.NewVirtualMachine(client, vm.Ref).Reconfigure(ctx, types.VirtualMachineConfigSpec{
+		ManagedBy: &types.ManagedByInfo{
+			ExtensionKey: extensionKey,
+			Type:         managedType,
+		},
+	})
+	if err != nil {
+		t.Fatalf("setting vm managedBy: %v", err)
+	}
+	if err := task.Wait(ctx); err != nil {
+		t.Fatalf("waiting for vm managedBy reconfiguration: %v", err)
+	}
+}
+
 // clusterVmRefs returns the VM references inside the simulator cluster.
 func clusterVmRefs(t *testing.T, ctx context.Context, client *vim25.Client) []types.ManagedObjectReference {
 	t.Helper()

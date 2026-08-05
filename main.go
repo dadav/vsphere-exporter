@@ -34,7 +34,7 @@ func init() {
 	flag.BoolVar(&enableDebug, "debug", os.Getenv("GOVC_DEBUG") == "1",
 		"Print one-shot cluster calculation diagnostics and exit without exposing metrics")
 	flag.StringVar(&excludeVmFolders, "exclude-vm-folders", os.Getenv("GOVC_EXCLUDE_VM_FOLDERS"),
-		"Comma-separated folder names whose VMs, including those in subfolders, are excluded from the cluster allocation metrics (e.g. SRM placeholder folders)")
+		"Comma-separated folder names whose VMs, including those in subfolders, are additionally excluded from the cluster allocation metrics")
 }
 
 // splitCommaList splits a comma separated flag value into trimmed, non-empty

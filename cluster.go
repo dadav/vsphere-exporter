@@ -19,7 +19,10 @@ import (
 )
 
 const (
+	srmManagedByExtensionKey            = "com.vmware.vcDR"
+	srmPlaceholderVmType                = "placeholderVm"
 	vmAllocationReasonIncluded          = "included"
+	vmAllocationReasonSrmPlaceholder    = "srm_placeholder"
 	vmAllocationReasonTemplate          = "template"
 	vmAllocationReasonUnpopulatedConfig = "unpopulated_config"
 	vmAllocationReasonExcludedFolder    = "excluded_folder"
@@ -111,11 +114,11 @@ func newClusterMetrics(reg prometheus.Registerer) *clusterMetrics {
 		}, []string{"name"}),
 		vmVcpus: auto.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "vcenter_cluster_vm_vcpus_allocated",
-			Help: "Sum of configured vCPUs of all virtual machines in the compute cluster, including powered off ones, excluding VMs in excluded folders",
+			Help: "Sum of configured vCPUs of all virtual machines in the compute cluster, including powered off ones, excluding SRM placeholders and VMs in excluded folders",
 		}, []string{"name"}),
 		vmMemory: auto.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "vcenter_cluster_vm_memory_bytes_allocated",
-			Help: "Sum of configured memory of all virtual machines in the compute cluster in bytes, including powered off ones, excluding VMs in excluded folders",
+			Help: "Sum of configured memory of all virtual machines in the compute cluster in bytes, including powered off ones, excluding SRM placeholders and VMs in excluded folders",
 		}, []string{"name"}),
 		cpuThreadsAvail: auto.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "vcenter_cluster_cpu_threads_available",
@@ -396,10 +399,10 @@ func summarizeClusterHosts(hosts []mo.HostSystem) (clusterHostCapacity, string, 
 
 // clusterVmAllocation sums the configured vCPUs and memory (bytes) of all
 // virtual machines inside the given cluster. Templates, VMs without a populated
-// config and VMs whose parent folder is in excludedFolders are skipped. The
-// excluded set already contains all descendant folders, so the direct parent
-// lookup covers subfolders too. Power state is deliberately ignored, so powered
-// off VMs count towards the allocation.
+// config, SRM placeholder VMs and VMs whose parent folder is in excludedFolders
+// are skipped. The excluded set already contains all descendant folders, so the
+// direct parent lookup covers subfolders too. Power state is deliberately
+// ignored, so powered off VMs count towards the allocation.
 func clusterVmAllocation(ctx context.Context, viewManager *view.Manager, cluster types.ManagedObjectReference, clusterName string, excludedFolders map[types.ManagedObjectReference]string, debugLogger *slog.Logger) (vmAllocation, error) {
 	vmView, err := viewManager.CreateContainerView(ctx, cluster, []string{"VirtualMachine"}, true)
 	if err != nil {
@@ -424,6 +427,12 @@ func clusterVmAllocation(ctx context.Context, viewManager *view.Manager, cluster
 		counted, reason, excludedBy := classifyVmAllocation(vm, excludedFolders)
 		memoryBytes := int64(vm.Summary.Config.MemorySizeMB) * 1024 * 1024
 		if debugLogger != nil {
+			managedByExtension := ""
+			managedByType := ""
+			if vm.Summary.Config.ManagedBy != nil {
+				managedByExtension = vm.Summary.Config.ManagedBy.ExtensionKey
+				managedByType = vm.Summary.Config.ManagedBy.Type
+			}
 			debugLogger.Debug("vm allocation decision",
 				"cluster", clusterName,
 				"vm", vm.Name,
@@ -434,6 +443,8 @@ func clusterVmAllocation(ctx context.Context, viewManager *view.Manager, cluster
 				"memory_bytes", memoryBytes,
 				"counted", counted,
 				"reason", reason,
+				"managed_by_extension", managedByExtension,
+				"managed_by_type", managedByType,
 				"excluded_by_folder", excludedBy)
 		}
 		if !counted {
@@ -448,6 +459,10 @@ func clusterVmAllocation(ctx context.Context, viewManager *view.Manager, cluster
 }
 
 func classifyVmAllocation(vm mo.VirtualMachine, excludedFolders map[types.ManagedObjectReference]string) (bool, string, string) {
+	managedBy := vm.Summary.Config.ManagedBy
+	if managedBy != nil && managedBy.ExtensionKey == srmManagedByExtensionKey && managedBy.Type == srmPlaceholderVmType {
+		return false, vmAllocationReasonSrmPlaceholder, ""
+	}
 	if vm.Summary.Config.Template {
 		return false, vmAllocationReasonTemplate, ""
 	}
