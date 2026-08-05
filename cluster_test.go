@@ -78,7 +78,7 @@ func TestClassifyVmAllocation(t *testing.T) {
 	}
 }
 
-func TestSummarizeClusterHostsTracksCoresAndThreadsIndependently(t *testing.T) {
+func TestSummarizeClusterHostsSeparatesPhysicalCoresAndLogicalThreads(t *testing.T) {
 	host := func(name string, cores, threads int16, memory int64) mo.HostSystem {
 		var host mo.HostSystem
 		host.Name = name
@@ -99,14 +99,12 @@ func TestSummarizeClusterHostsTracksCoresAndThreadsIndependently(t *testing.T) {
 	}
 
 	want := clusterHostCapacity{
-		cpuCoresTotal:        20,
-		cpuReserveCores:      12,
-		cpuReserveHost:       "host-b",
-		cpuThreadsTotal:      28,
-		cpuReserveThreads:    16,
-		cpuReserveThreadHost: "host-a",
-		memoryReserveBytes:   128,
-		memoryReserveHost:    "host-b",
+		cpuPhysicalCoresTotal: 20,
+		cpuThreadsTotal:       28,
+		cpuReserveThreads:     16,
+		cpuReserveThreadHost:  "host-a",
+		memoryReserveBytes:    128,
+		memoryReserveHost:     "host-b",
 	}
 	if capacity != want {
 		t.Errorf("summarizeClusterHosts() = %+v, want %+v", capacity, want)
@@ -115,9 +113,6 @@ func TestSummarizeClusterHostsTracksCoresAndThreadsIndependently(t *testing.T) {
 	const allocatedVcpus = int64(10)
 	if got := capacity.cpuThreadsTotal - capacity.cpuReserveThreads - allocatedVcpus; got != 2 {
 		t.Errorf("logical CPU threads available = %d, want 2", got)
-	}
-	if got := capacity.cpuCoresTotal - capacity.cpuReserveCores - allocatedVcpus; got != -2 {
-		t.Errorf("legacy physical CPU cores available = %d, want -2", got)
 	}
 }
 
@@ -143,14 +138,12 @@ func TestClusterDebugDiagnostics(t *testing.T) {
 			`reason=included`,
 			`msg="cluster capacity calculation"`,
 			`complete=true`,
-			`cpu_ha_reserve_host=`,
+			`cpu_ha_reserve_thread_host=`,
 			`memory_ha_reserve_host=`,
-			fmt.Sprintf("vm_cpu_cores_allocated=%d", int64(gaugeValue(t, metrics.vmCpuCores, simulatorClusterName))),
 			fmt.Sprintf("vm_vcpus_allocated=%d", int64(gaugeValue(t, metrics.vmVcpus, simulatorClusterName))),
 			fmt.Sprintf("vm_memory_bytes_allocated=%d", int64(gaugeValue(t, metrics.vmMemory, simulatorClusterName))),
 			fmt.Sprintf("memory_bytes_available=%d", int64(gaugeValue(t, metrics.memoryAvail, simulatorClusterName))),
-			fmt.Sprintf("cpu_cores_total=%d", int64(gaugeValue(t, metrics.cpuCoresTotal, simulatorClusterName))),
-			fmt.Sprintf("cpu_cores_available=%d", int64(gaugeValue(t, metrics.cpuCoresAvail, simulatorClusterName))),
+			fmt.Sprintf("cpu_physical_cores_total=%d", int64(gaugeValue(t, metrics.cpuPhysicalCoresTotal, simulatorClusterName))),
 			fmt.Sprintf("cpu_threads_total=%d", int64(gaugeValue(t, metrics.cpuThreadsTotal, simulatorClusterName))),
 			fmt.Sprintf("cpu_threads_available=%d", int64(gaugeValue(t, metrics.cpuThreadsAvail, simulatorClusterName))),
 			fmt.Sprintf("memory_bytes_total=%d", int64(gaugeValue(t, metrics.memoryTotal, simulatorClusterName))),
@@ -182,7 +175,6 @@ func TestLogClusterCalculationIncomplete(t *testing.T) {
 		`complete=false`,
 		`reason=no_hosts`,
 		`memory_bytes_total=12345`,
-		`vm_cpu_cores_allocated=4`,
 		`vm_vcpus_allocated=4`,
 		`vm_memory_bytes_allocated=8192`,
 		`vms_total=3`,
@@ -217,7 +209,6 @@ func TestClusterDebugDiagnosticsWithoutHosts(t *testing.T) {
 			`complete=false`,
 			`reason=no_hosts`,
 			fmt.Sprintf("memory_bytes_total=%d", int64(gaugeValue(t, metrics.memoryTotal, emptyCluster))),
-			fmt.Sprintf("vm_cpu_cores_allocated=%d", int64(gaugeValue(t, metrics.vmCpuCores, emptyCluster))),
 			fmt.Sprintf("vm_vcpus_allocated=%d", int64(gaugeValue(t, metrics.vmVcpus, emptyCluster))),
 		} {
 			if !strings.Contains(record, fragment) {
@@ -276,7 +267,8 @@ func TestClusterDebugDiagnosticsSkippedVm(t *testing.T) {
 
 func TestCollectClusterMetrics(t *testing.T) {
 	simulator.Test(func(ctx context.Context, client *vim25.Client) {
-		metrics := newClusterMetrics(prometheus.NewRegistry())
+		reg := prometheus.NewRegistry()
+		metrics := newClusterMetrics(reg)
 
 		if err := collectClusterMetrics(ctx, client, metrics, nil); err != nil {
 			t.Fatalf("collectClusterMetrics: %v", err)
@@ -289,8 +281,8 @@ func TestCollectClusterMetrics(t *testing.T) {
 
 		stats := clusterHostStats(t, ctx, client)
 
-		if got := gaugeValue(t, metrics.cpuCoresTotal, simulatorClusterName); got != float64(stats.TotalCores) {
-			t.Errorf("cpu_cores_total = %v, want %v", got, stats.TotalCores)
+		if got := gaugeValue(t, metrics.cpuPhysicalCoresTotal, simulatorClusterName); got != float64(stats.TotalCores) {
+			t.Errorf("cpu_physical_cores_total = %v, want %v", got, stats.TotalCores)
 		}
 		if got := gaugeValue(t, metrics.cpuThreadsTotal, simulatorClusterName); got != float64(stats.TotalThreads) {
 			t.Errorf("cpu_threads_total = %v, want %v", got, stats.TotalThreads)
@@ -301,22 +293,12 @@ func TestCollectClusterMetrics(t *testing.T) {
 		if vmVcpus <= 0 {
 			t.Errorf("vm_vcpus_allocated = %v, want > 0", vmVcpus)
 		}
-		if got := gaugeValue(t, metrics.vmCpuCores, simulatorClusterName); got != vmVcpus {
-			t.Errorf("legacy vm_cpu_cores_allocated = %v, want alias value %v", got, vmVcpus)
-		}
 		if vmMemory <= 0 {
 			t.Errorf("vm_memory_bytes_allocated = %v, want > 0", vmMemory)
 		}
 
 		// The exported available values must be reproducible from the other
 		// exported gauges, so dashboards can rely on the identity.
-		coresTotal := gaugeValue(t, metrics.cpuCoresTotal, simulatorClusterName)
-		wantCores := coresTotal - float64(stats.MaxCores) - vmVcpus
-		if got := gaugeValue(t, metrics.cpuCoresAvail, simulatorClusterName); got != wantCores {
-			t.Errorf("cpu_cores_available = %v, want %v (total %v - largest host %d - vms %v)",
-				got, wantCores, coresTotal, stats.MaxCores, vmVcpus)
-		}
-
 		threadsTotal := gaugeValue(t, metrics.cpuThreadsTotal, simulatorClusterName)
 		wantThreads := threadsTotal - float64(stats.MaxThreads) - vmVcpus
 		if got := gaugeValue(t, metrics.cpuThreadsAvail, simulatorClusterName); got != wantThreads {
@@ -329,6 +311,21 @@ func TestCollectClusterMetrics(t *testing.T) {
 		if got := gaugeValue(t, metrics.memoryAvail, simulatorClusterName); got != wantMemory {
 			t.Errorf("memory_bytes_available = %v, want %v (total %v - largest host %d - vms %v)",
 				got, wantMemory, memoryTotal, stats.MaxMemory, vmMemory)
+		}
+
+		families, err := reg.Gather()
+		if err != nil {
+			t.Fatalf("gathering metrics: %v", err)
+		}
+		removed := map[string]bool{
+			"vcenter_cluster_cpu_cores_total":        true,
+			"vcenter_cluster_vm_cpu_cores_allocated": true,
+			"vcenter_cluster_cpu_cores_available":    true,
+		}
+		for _, family := range families {
+			if removed[family.GetName()] {
+				t.Errorf("removed metric family %q is still exported", family.GetName())
+			}
 		}
 	})
 }
@@ -362,9 +359,6 @@ func TestPoweredOffVmsAreCounted(t *testing.T) {
 		if got := gaugeValue(t, after.vmVcpus, simulatorClusterName); got != vcpusBefore {
 			t.Errorf("vm_vcpus_allocated after power off = %v, want unchanged %v", got, vcpusBefore)
 		}
-		if got := gaugeValue(t, after.vmCpuCores, simulatorClusterName); got != vcpusBefore {
-			t.Errorf("legacy vm_cpu_cores_allocated after power off = %v, want unchanged %v", got, vcpusBefore)
-		}
 		if got := gaugeValue(t, after.vmMemory, simulatorClusterName); got != memoryBefore {
 			t.Errorf("vm_memory_bytes_allocated after power off = %v, want unchanged %v", got, memoryBefore)
 		}
@@ -376,9 +370,10 @@ func TestStaleClusterSeriesAreDropped(t *testing.T) {
 		reg := prometheus.NewRegistry()
 		metrics := newClusterMetrics(reg)
 
-		// Simulate leftover legacy and logical-CPU series from a cluster that
+		// Simulate leftover physical and logical-CPU series from a cluster that
 		// no longer exists.
 		metrics.hostsTotal.WithLabelValues("ghost-cluster").Set(99)
+		metrics.cpuPhysicalCoresTotal.WithLabelValues("ghost-cluster").Set(99)
 		metrics.cpuThreadsTotal.WithLabelValues("ghost-cluster").Set(99)
 		metrics.vmVcpus.WithLabelValues("ghost-cluster").Set(99)
 		metrics.cpuThreadsAvail.WithLabelValues("ghost-cluster").Set(99)
@@ -419,9 +414,6 @@ func assertVmExcluded(t *testing.T, ctx context.Context, client *vim25.Client, e
 		t.Errorf("vm_vcpus_allocated with exclusion = %v, want %v (%v - excluded vm %v)",
 			got, wantVcpus, vcpusBefore, vm.Cores)
 	}
-	if got := gaugeValue(t, excluded.vmCpuCores, simulatorClusterName); got != wantVcpus {
-		t.Errorf("legacy vm_cpu_cores_allocated with exclusion = %v, want alias value %v", got, wantVcpus)
-	}
 	wantMemory := memoryBefore - vm.Memory
 	if got := gaugeValue(t, excluded.vmMemory, simulatorClusterName); got != wantMemory {
 		t.Errorf("vm_memory_bytes_allocated with exclusion = %v, want %v (%v - excluded vm %v)",
@@ -429,11 +421,6 @@ func assertVmExcluded(t *testing.T, ctx context.Context, client *vim25.Client, e
 	}
 
 	stats := clusterHostStats(t, ctx, client)
-	coresTotal := gaugeValue(t, excluded.cpuCoresTotal, simulatorClusterName)
-	wantCoresAvail := coresTotal - float64(stats.MaxCores) - wantVcpus
-	if got := gaugeValue(t, excluded.cpuCoresAvail, simulatorClusterName); got != wantCoresAvail {
-		t.Errorf("cpu_cores_available with exclusion = %v, want %v", got, wantCoresAvail)
-	}
 	threadsTotal := gaugeValue(t, excluded.cpuThreadsTotal, simulatorClusterName)
 	wantThreadsAvail := threadsTotal - float64(stats.MaxThreads) - wantVcpus
 	if got := gaugeValue(t, excluded.cpuThreadsAvail, simulatorClusterName); got != wantThreadsAvail {
@@ -474,9 +461,6 @@ func TestExcludedFolderVmsNotCounted(t *testing.T) {
 		}
 		if got := gaugeValue(t, unfiltered.vmVcpus, simulatorClusterName); got != vcpusBefore {
 			t.Errorf("vm_vcpus_allocated without exclusion = %v, want unchanged %v", got, vcpusBefore)
-		}
-		if got := gaugeValue(t, unfiltered.vmCpuCores, simulatorClusterName); got != vcpusBefore {
-			t.Errorf("legacy vm_cpu_cores_allocated without exclusion = %v, want unchanged %v", got, vcpusBefore)
 		}
 		if got := gaugeValue(t, unfiltered.vmMemory, simulatorClusterName); got != memoryBefore {
 			t.Errorf("vm_memory_bytes_allocated without exclusion = %v, want unchanged %v", got, memoryBefore)
@@ -524,9 +508,6 @@ func TestExcludedFolderNameNotFound(t *testing.T) {
 		want := gaugeValue(t, baseline.vmVcpus, simulatorClusterName)
 		if got := gaugeValue(t, metrics.vmVcpus, simulatorClusterName); got != want {
 			t.Errorf("vm_vcpus_allocated = %v, want unchanged %v", got, want)
-		}
-		if got := gaugeValue(t, metrics.vmCpuCores, simulatorClusterName); got != want {
-			t.Errorf("legacy vm_cpu_cores_allocated = %v, want unchanged %v", got, want)
 		}
 	})
 }

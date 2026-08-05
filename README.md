@@ -57,21 +57,24 @@ Development commands are in the `justfile` (`just test`, `just build`, `just run
 |---|---|
 | `vcenter_cluster_hosts_total` | Hosts in the cluster |
 | `vcenter_cluster_hosts_effective` | Connected, non-maintenance hosts |
-| `vcenter_cluster_cpu_cores_total` | Physical CPU cores of all hosts |
+| `vcenter_cluster_cpu_physical_cores_total` | Physical CPU cores of all hosts |
 | `vcenter_cluster_cpu_threads_total` | Logical CPU threads of all hosts |
 | `vcenter_cluster_cpu_mhz_total` | Total CPU capacity in MHz |
 | `vcenter_cluster_memory_bytes_total` | Total memory capacity |
 | `vcenter_cluster_vm_vcpus_allocated` | Sum of configured vCPUs of all VMs, powered-off included, excluded folders left out |
-| `vcenter_cluster_vm_cpu_cores_allocated` | Deprecated compatibility alias for `vcenter_cluster_vm_vcpus_allocated` |
 | `vcenter_cluster_vm_memory_bytes_allocated` | Sum of configured VM memory, powered-off included, excluded folders left out |
 | `vcenter_cluster_cpu_threads_available` | Logical CPU threads left after HA reserve and VM allocation |
-| `vcenter_cluster_cpu_cores_available` | Deprecated legacy calculation mixing physical cores and allocated vCPUs |
 | `vcenter_cluster_memory_bytes_available` | Memory left after HA reserve and VM allocation |
 | `vcenter_datastore_capacity_bytes` | Datastore capacity |
 | `vcenter_datastore_free_bytes` | Datastore free space |
 | `vcenter_cluster_scrape_failures_total`, `vcenter_datastore_scrape_failures_total` | Scrape error counters |
 
 Cluster metrics are labelled with `name` (cluster name), datastore metrics with `name` and `url`.
+
+CPU metric migration: replace `vcenter_cluster_cpu_cores_total` with
+`vcenter_cluster_cpu_physical_cores_total`, `vcenter_cluster_vm_cpu_cores_allocated`
+with `vcenter_cluster_vm_vcpus_allocated`, and `vcenter_cluster_cpu_cores_available`
+with `vcenter_cluster_cpu_threads_available`. The old names are no longer exported.
 
 The logical CPU thread and memory availability metrics implement the capacity formula, no PromQL math needed:
 
@@ -107,7 +110,7 @@ vcenter_cluster_vm_vcpus_allocated / vcenter_cluster_cpu_threads_total
 Physical-core overcommit ratio (allocated vCPUs per physical core):
 
 ```promql
-vcenter_cluster_vm_vcpus_allocated / vcenter_cluster_cpu_cores_total
+vcenter_cluster_vm_vcpus_allocated / vcenter_cluster_cpu_physical_cores_total
 ```
 
 How many more VMs of a given size still fit (example: 4 vCPUs, 16 GiB), limited by

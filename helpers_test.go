@@ -30,7 +30,6 @@ func gaugeValue(t *testing.T, gauge *prometheus.GaugeVec, labels ...string) floa
 // of the exporter code.
 type hostStats struct {
 	TotalCores   int64
-	MaxCores     int64
 	TotalThreads int64
 	MaxThreads   int64
 	TotalMemory  int64
@@ -78,9 +77,6 @@ func clusterHostStats(t *testing.T, ctx context.Context, client *vim25.Client) h
 		stats.TotalCores += cores
 		stats.TotalThreads += threads
 		stats.TotalMemory += memory
-		if cores > stats.MaxCores {
-			stats.MaxCores = cores
-		}
 		if threads > stats.MaxThreads {
 			stats.MaxThreads = threads
 		}
