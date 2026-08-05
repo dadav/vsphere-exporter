@@ -80,8 +80,10 @@ type clusterMetrics struct {
 	hostsEffective        *prometheus.GaugeVec
 	cpuPhysicalCoresTotal *prometheus.GaugeVec
 	cpuThreadsTotal       *prometheus.GaugeVec
+	cpuThreadsHAReserved  *prometheus.GaugeVec
 	cpuMhzTotal           *prometheus.GaugeVec
 	memoryTotal           *prometheus.GaugeVec
+	memoryHAReserved      *prometheus.GaugeVec
 	vmVcpus               *prometheus.GaugeVec
 	vmMemory              *prometheus.GaugeVec
 	cpuThreadsAvail       *prometheus.GaugeVec
@@ -108,6 +110,10 @@ func newClusterMetrics(reg prometheus.Registerer) *clusterMetrics {
 			Name: "vcenter_cluster_cpu_threads_total",
 			Help: "Total number of logical CPU threads of all hosts in the compute cluster",
 		}, []string{"name"}),
+		cpuThreadsHAReserved: auto.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "vcenter_cluster_cpu_threads_ha_reserved",
+			Help: "Logical CPU threads on the largest host, reserved by the exporter for single-host HA failover",
+		}, []string{"name"}),
 		cpuMhzTotal: auto.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "vcenter_cluster_cpu_mhz_total",
 			Help: "Total CPU capacity of the compute cluster in MHz",
@@ -115,6 +121,10 @@ func newClusterMetrics(reg prometheus.Registerer) *clusterMetrics {
 		memoryTotal: auto.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "vcenter_cluster_memory_bytes_total",
 			Help: "Total memory capacity of the compute cluster in bytes",
+		}, []string{"name"}),
+		memoryHAReserved: auto.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "vcenter_cluster_memory_bytes_ha_reserved",
+			Help: "Memory on the largest-memory host in bytes, reserved by the exporter for single-host HA failover",
 		}, []string{"name"}),
 		vmVcpus: auto.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "vcenter_cluster_vm_vcpus_allocated",
@@ -146,8 +156,10 @@ func (m *clusterMetrics) resetGauges() {
 	m.hostsEffective.Reset()
 	m.cpuPhysicalCoresTotal.Reset()
 	m.cpuThreadsTotal.Reset()
+	m.cpuThreadsHAReserved.Reset()
 	m.cpuMhzTotal.Reset()
 	m.memoryTotal.Reset()
+	m.memoryHAReserved.Reset()
 	m.vmVcpus.Reset()
 	m.vmMemory.Reset()
 	m.cpuThreadsAvail.Reset()
@@ -352,6 +364,8 @@ func collectOneCluster(ctx context.Context, viewManager *view.Manager, propColle
 
 	metrics.cpuPhysicalCoresTotal.WithLabelValues(name).Set(float64(capacity.cpuPhysicalCoresTotal))
 	metrics.cpuThreadsTotal.WithLabelValues(name).Set(float64(capacity.cpuThreadsTotal))
+	metrics.cpuThreadsHAReserved.WithLabelValues(name).Set(float64(capacity.cpuReserveThreads))
+	metrics.memoryHAReserved.WithLabelValues(name).Set(float64(capacity.memoryReserveBytes))
 	metrics.cpuThreadsAvail.WithLabelValues(name).Set(float64(calc.cpuThreadsAvailable))
 
 	// Available memory is derived from the same cluster summary value that is

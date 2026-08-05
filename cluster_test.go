@@ -370,6 +370,12 @@ func TestCollectClusterMetrics(t *testing.T) {
 		if got := gaugeValue(t, metrics.cpuThreadsTotal, simulatorClusterName); got != float64(stats.TotalThreads) {
 			t.Errorf("cpu_threads_total = %v, want %v", got, stats.TotalThreads)
 		}
+		if got := gaugeValue(t, metrics.cpuThreadsHAReserved, simulatorClusterName); got != float64(stats.MaxThreads) {
+			t.Errorf("cpu_threads_ha_reserved = %v, want %v", got, stats.MaxThreads)
+		}
+		if got := gaugeValue(t, metrics.memoryHAReserved, simulatorClusterName); got != float64(stats.MaxMemory) {
+			t.Errorf("memory_bytes_ha_reserved = %v, want %v", got, stats.MaxMemory)
+		}
 
 		vmVcpus := gaugeValue(t, metrics.vmVcpus, simulatorClusterName)
 		vmMemory := gaugeValue(t, metrics.vmMemory, simulatorClusterName)
@@ -383,17 +389,19 @@ func TestCollectClusterMetrics(t *testing.T) {
 		// The exported available values must be reproducible from the other
 		// exported gauges, so dashboards can rely on the identity.
 		threadsTotal := gaugeValue(t, metrics.cpuThreadsTotal, simulatorClusterName)
-		wantThreads := threadsTotal - float64(stats.MaxThreads) - vmVcpus
+		threadsHAReserved := gaugeValue(t, metrics.cpuThreadsHAReserved, simulatorClusterName)
+		wantThreads := threadsTotal - threadsHAReserved - vmVcpus
 		if got := gaugeValue(t, metrics.cpuThreadsAvail, simulatorClusterName); got != wantThreads {
-			t.Errorf("cpu_threads_available = %v, want %v (total %v - largest host %d - vCPUs %v)",
-				got, wantThreads, threadsTotal, stats.MaxThreads, vmVcpus)
+			t.Errorf("cpu_threads_available = %v, want %v (total %v - HA reserve %v - vCPUs %v)",
+				got, wantThreads, threadsTotal, threadsHAReserved, vmVcpus)
 		}
 
 		memoryTotal := gaugeValue(t, metrics.memoryTotal, simulatorClusterName)
-		wantMemory := memoryTotal - float64(stats.MaxMemory) - vmMemory
+		memoryHAReserved := gaugeValue(t, metrics.memoryHAReserved, simulatorClusterName)
+		wantMemory := memoryTotal - memoryHAReserved - vmMemory
 		if got := gaugeValue(t, metrics.memoryAvail, simulatorClusterName); got != wantMemory {
-			t.Errorf("memory_bytes_available = %v, want %v (total %v - largest host %d - vms %v)",
-				got, wantMemory, memoryTotal, stats.MaxMemory, vmMemory)
+			t.Errorf("memory_bytes_available = %v, want %v (total %v - HA reserve %v - vms %v)",
+				got, wantMemory, memoryTotal, memoryHAReserved, vmMemory)
 		}
 
 		families, err := reg.Gather()
@@ -405,9 +413,21 @@ func TestCollectClusterMetrics(t *testing.T) {
 			"vcenter_cluster_vm_cpu_cores_allocated": true,
 			"vcenter_cluster_cpu_cores_available":    true,
 		}
+		expected := map[string]bool{
+			"vcenter_cluster_cpu_threads_ha_reserved":  false,
+			"vcenter_cluster_memory_bytes_ha_reserved": false,
+		}
 		for _, family := range families {
 			if removed[family.GetName()] {
 				t.Errorf("removed metric family %q is still exported", family.GetName())
+			}
+			if _, ok := expected[family.GetName()]; ok {
+				expected[family.GetName()] = true
+			}
+		}
+		for name, found := range expected {
+			if !found {
+				t.Errorf("expected metric family %q is not exported", name)
 			}
 		}
 	})
@@ -458,6 +478,8 @@ func TestStaleClusterSeriesAreDropped(t *testing.T) {
 		metrics.hostsTotal.WithLabelValues("ghost-cluster").Set(99)
 		metrics.cpuPhysicalCoresTotal.WithLabelValues("ghost-cluster").Set(99)
 		metrics.cpuThreadsTotal.WithLabelValues("ghost-cluster").Set(99)
+		metrics.cpuThreadsHAReserved.WithLabelValues("ghost-cluster").Set(99)
+		metrics.memoryHAReserved.WithLabelValues("ghost-cluster").Set(99)
 		metrics.vmVcpus.WithLabelValues("ghost-cluster").Set(99)
 		metrics.cpuThreadsAvail.WithLabelValues("ghost-cluster").Set(99)
 
@@ -503,14 +525,15 @@ func assertVmExcluded(t *testing.T, ctx context.Context, client *vim25.Client, e
 			got, wantMemory, memoryBefore, vm.Memory)
 	}
 
-	stats := clusterHostStats(t, ctx, client)
 	threadsTotal := gaugeValue(t, excluded.cpuThreadsTotal, simulatorClusterName)
-	wantThreadsAvail := threadsTotal - float64(stats.MaxThreads) - wantVcpus
+	threadsHAReserved := gaugeValue(t, excluded.cpuThreadsHAReserved, simulatorClusterName)
+	wantThreadsAvail := threadsTotal - threadsHAReserved - wantVcpus
 	if got := gaugeValue(t, excluded.cpuThreadsAvail, simulatorClusterName); got != wantThreadsAvail {
 		t.Errorf("cpu_threads_available with exclusion = %v, want %v", got, wantThreadsAvail)
 	}
 	memoryTotal := gaugeValue(t, excluded.memoryTotal, simulatorClusterName)
-	wantMemoryAvail := memoryTotal - float64(stats.MaxMemory) - wantMemory
+	memoryHAReserved := gaugeValue(t, excluded.memoryHAReserved, simulatorClusterName)
+	wantMemoryAvail := memoryTotal - memoryHAReserved - wantMemory
 	if got := gaugeValue(t, excluded.memoryAvail, simulatorClusterName); got != wantMemoryAvail {
 		t.Errorf("memory_bytes_available with exclusion = %v, want %v", got, wantMemoryAvail)
 	}

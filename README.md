@@ -65,8 +65,10 @@ Development commands are in the `justfile` (`just test`, `just build`, `just run
 | `vcenter_cluster_hosts_effective` | Connected, non-maintenance hosts |
 | `vcenter_cluster_cpu_physical_cores_total` | Physical CPU cores of all hosts |
 | `vcenter_cluster_cpu_threads_total` | Logical CPU threads of all hosts |
+| `vcenter_cluster_cpu_threads_ha_reserved` | Logical CPU threads on the largest host, reserved by the exporter for single-host HA failover |
 | `vcenter_cluster_cpu_mhz_total` | Total CPU capacity in MHz |
 | `vcenter_cluster_memory_bytes_total` | Total memory capacity |
+| `vcenter_cluster_memory_bytes_ha_reserved` | Memory on the largest-memory host, reserved by the exporter for single-host HA failover |
 | `vcenter_cluster_vm_vcpus_allocated` | Sum of configured vCPUs of all VMs, powered-off included, SRM placeholders and excluded folders left out |
 | `vcenter_cluster_vm_memory_bytes_allocated` | Sum of configured VM memory, powered-off included, SRM placeholders and excluded folders left out |
 | `vcenter_cluster_cpu_threads_available` | Logical CPU threads left after HA reserve and VM allocation |
@@ -82,12 +84,17 @@ CPU metric migration: replace `vcenter_cluster_cpu_cores_total` with
 with `vcenter_cluster_vm_vcpus_allocated`, and `vcenter_cluster_cpu_cores_available`
 with `vcenter_cluster_cpu_threads_available`. The old names are no longer exported.
 
-The logical CPU thread and memory availability metrics implement the capacity formula, no PromQL math needed:
+The logical CPU thread and memory availability metrics implement the same capacity formula that can now be reproduced from the exported gauges:
 
 ```
-CPU threads available = total host threads - largest host thread count - allocated vCPUs
-memory available = total memory - largest host memory - allocated VM memory
+CPU threads available = total host threads - HA-reserved threads - allocated vCPUs
+memory available = total memory - HA-reserved memory - allocated VM memory
 ```
+
+The CPU and memory HA reserves are calculated independently, so heterogeneous
+clusters may use different largest hosts for the two values. They are the
+exporter's single-host failover inputs, not vCenter admission-control policy
+percentages.
 
 VM allocations come from the VM config, so powered-off VMs are included.
 Available values go negative when the cluster is overcommitted past the HA reserve.
@@ -99,6 +106,18 @@ Remaining logical CPU threads and memory per cluster (HA reserve already subtrac
 ```promql
 vcenter_cluster_cpu_threads_available
 vcenter_cluster_memory_bytes_available
+```
+
+Calculate the same values explicitly in Grafana:
+
+```promql
+vcenter_cluster_cpu_threads_total
+  - vcenter_cluster_cpu_threads_ha_reserved
+  - vcenter_cluster_vm_vcpus_allocated
+
+vcenter_cluster_memory_bytes_total
+  - vcenter_cluster_memory_bytes_ha_reserved
+  - vcenter_cluster_vm_memory_bytes_allocated
 ```
 
 Remaining memory as a percentage of cluster capacity:
