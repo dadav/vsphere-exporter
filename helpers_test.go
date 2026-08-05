@@ -29,10 +29,12 @@ func gaugeValue(t *testing.T, gauge *prometheus.GaugeVec, labels ...string) floa
 // hostStats are the host hardware totals of a cluster, computed independently
 // of the exporter code.
 type hostStats struct {
-	TotalCores  int64
-	MaxCores    int64
-	TotalMemory int64
-	MaxMemory   int64
+	TotalCores   int64
+	MaxCores     int64
+	TotalThreads int64
+	MaxThreads   int64
+	TotalMemory  int64
+	MaxMemory    int64
 }
 
 func clusterHostStats(t *testing.T, ctx context.Context, client *vim25.Client) hostStats {
@@ -70,12 +72,17 @@ func clusterHostStats(t *testing.T, ctx context.Context, client *vim25.Client) h
 			continue
 		}
 		cores := int64(host.Summary.Hardware.NumCpuCores)
+		threads := int64(host.Summary.Hardware.NumCpuThreads)
 		memory := host.Summary.Hardware.MemorySize
 
 		stats.TotalCores += cores
+		stats.TotalThreads += threads
 		stats.TotalMemory += memory
 		if cores > stats.MaxCores {
 			stats.MaxCores = cores
+		}
+		if threads > stats.MaxThreads {
+			stats.MaxThreads = threads
 		}
 		if memory > stats.MaxMemory {
 			stats.MaxMemory = memory

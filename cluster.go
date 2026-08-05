@@ -26,11 +26,22 @@ const (
 )
 
 type vmAllocation struct {
-	cpuCores    int64
+	vcpus       int64
 	memoryBytes int64
 	totalVMs    int
 	countedVMs  int
 	skippedVMs  int
+}
+
+type clusterHostCapacity struct {
+	cpuCoresTotal        int64
+	cpuReserveCores      int64
+	cpuReserveHost       string
+	cpuThreadsTotal      int64
+	cpuReserveThreads    int64
+	cpuReserveThreadHost string
+	memoryReserveBytes   int64
+	memoryReserveHost    string
 }
 
 // clusterCalculation captures the inputs of the cluster capacity formulas so
@@ -45,10 +56,14 @@ type clusterCalculation struct {
 	reason     string
 	allocation vmAllocation
 
-	cpuCoresTotal     int64
-	cpuReserveCores   int64
-	cpuReserveHost    string
-	cpuCoresAvailable int64
+	cpuCoresTotal        int64
+	cpuReserveCores      int64
+	cpuReserveHost       string
+	cpuCoresAvailable    int64
+	cpuThreadsTotal      int64
+	cpuReserveThreads    int64
+	cpuReserveThreadHost string
+	cpuThreadsAvailable  int64
 
 	memoryBytesTotal     int64
 	memoryReserveBytes   int64
@@ -59,16 +74,19 @@ type clusterCalculation struct {
 // clusterMetrics holds the compute cluster capacity gauges. All gauges are
 // labelled with the cluster name.
 type clusterMetrics struct {
-	hostsTotal     *prometheus.GaugeVec
-	hostsEffective *prometheus.GaugeVec
-	cpuCoresTotal  *prometheus.GaugeVec
-	cpuMhzTotal    *prometheus.GaugeVec
-	memoryTotal    *prometheus.GaugeVec
-	vmCpuCores     *prometheus.GaugeVec
-	vmMemory       *prometheus.GaugeVec
-	cpuCoresAvail  *prometheus.GaugeVec
-	memoryAvail    *prometheus.GaugeVec
-	scrapeFailures prometheus.Counter
+	hostsTotal      *prometheus.GaugeVec
+	hostsEffective  *prometheus.GaugeVec
+	cpuCoresTotal   *prometheus.GaugeVec
+	cpuThreadsTotal *prometheus.GaugeVec
+	cpuMhzTotal     *prometheus.GaugeVec
+	memoryTotal     *prometheus.GaugeVec
+	vmCpuCores      *prometheus.GaugeVec
+	vmVcpus         *prometheus.GaugeVec
+	vmMemory        *prometheus.GaugeVec
+	cpuCoresAvail   *prometheus.GaugeVec
+	cpuThreadsAvail *prometheus.GaugeVec
+	memoryAvail     *prometheus.GaugeVec
+	scrapeFailures  prometheus.Counter
 }
 
 func newClusterMetrics(reg prometheus.Registerer) *clusterMetrics {
@@ -86,6 +104,10 @@ func newClusterMetrics(reg prometheus.Registerer) *clusterMetrics {
 			Name: "vcenter_cluster_cpu_cores_total",
 			Help: "Total number of physical CPU cores of all hosts in the compute cluster",
 		}, []string{"name"}),
+		cpuThreadsTotal: auto.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "vcenter_cluster_cpu_threads_total",
+			Help: "Total number of logical CPU threads of all hosts in the compute cluster",
+		}, []string{"name"}),
 		cpuMhzTotal: auto.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "vcenter_cluster_cpu_mhz_total",
 			Help: "Total CPU capacity of the compute cluster in MHz",
@@ -96,6 +118,10 @@ func newClusterMetrics(reg prometheus.Registerer) *clusterMetrics {
 		}, []string{"name"}),
 		vmCpuCores: auto.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "vcenter_cluster_vm_cpu_cores_allocated",
+			Help: "Deprecated: use vcenter_cluster_vm_vcpus_allocated. Sum of configured vCPUs of all virtual machines in the compute cluster, including powered off ones, excluding VMs in excluded folders",
+		}, []string{"name"}),
+		vmVcpus: auto.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "vcenter_cluster_vm_vcpus_allocated",
 			Help: "Sum of configured vCPUs of all virtual machines in the compute cluster, including powered off ones, excluding VMs in excluded folders",
 		}, []string{"name"}),
 		vmMemory: auto.NewGaugeVec(prometheus.GaugeOpts{
@@ -104,7 +130,11 @@ func newClusterMetrics(reg prometheus.Registerer) *clusterMetrics {
 		}, []string{"name"}),
 		cpuCoresAvail: auto.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "vcenter_cluster_cpu_cores_available",
-			Help: "Physical CPU cores left in the compute cluster after subtracting the largest host (HA reserve) and all allocated vCPUs. May be negative on overcommit",
+			Help: "Deprecated: use vcenter_cluster_cpu_threads_available. Legacy physical CPU core calculation after subtracting the largest host and all allocated vCPUs. May be negative on overcommit",
+		}, []string{"name"}),
+		cpuThreadsAvail: auto.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "vcenter_cluster_cpu_threads_available",
+			Help: "Logical CPU threads left in the compute cluster after subtracting the largest host (HA reserve) and all allocated vCPUs. May be negative on overcommit",
 		}, []string{"name"}),
 		memoryAvail: auto.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "vcenter_cluster_memory_bytes_available",
@@ -123,11 +153,14 @@ func (m *clusterMetrics) resetGauges() {
 	m.hostsTotal.Reset()
 	m.hostsEffective.Reset()
 	m.cpuCoresTotal.Reset()
+	m.cpuThreadsTotal.Reset()
 	m.cpuMhzTotal.Reset()
 	m.memoryTotal.Reset()
 	m.vmCpuCores.Reset()
+	m.vmVcpus.Reset()
 	m.vmMemory.Reset()
 	m.cpuCoresAvail.Reset()
+	m.cpuThreadsAvail.Reset()
 	m.memoryAvail.Reset()
 }
 
@@ -142,12 +175,15 @@ func collectClusterMetrics(ctx context.Context, client *vim25.Client, metrics *c
 // allocation decision and one per cluster capacity calculation, so the exported
 // numbers can be explained without a second code path.
 //
-// Available resources are computed as:
+// Logical CPU and memory availability are computed as:
 //
 //	total - largest host (reserved for HA failover) - sum of all VM allocations
 //
-// VM allocations come from the VM config and therefore include powered off VMs.
-// Available values may be negative when the cluster is overcommitted.
+// CPU capacity uses logical host threads so it has the same scheduling unit as
+// configured VM vCPUs. VM allocations come from the VM config and therefore
+// include powered off VMs. Available values may be negative when the cluster is
+// overcommitted. The physical-core availability gauge keeps its legacy formula
+// for compatibility.
 //
 // excludedFolderNames are VM folder names whose VMs, including those in
 // subfolders, do not count towards the allocation, e.g. the folder Site
@@ -287,7 +323,8 @@ func collectOneCluster(ctx context.Context, viewManager *view.Manager, propColle
 		return fmt.Errorf("retrieving vms: %w", err)
 	}
 	calc.allocation = allocation
-	metrics.vmCpuCores.WithLabelValues(name).Set(float64(allocation.cpuCores))
+	metrics.vmCpuCores.WithLabelValues(name).Set(float64(allocation.vcpus))
+	metrics.vmVcpus.WithLabelValues(name).Set(float64(allocation.vcpus))
 	metrics.vmMemory.WithLabelValues(name).Set(float64(allocation.memoryBytes))
 
 	if len(cluster.Host) == 0 {
@@ -305,44 +342,33 @@ func collectOneCluster(ctx context.Context, viewManager *view.Manager, propColle
 		sortByName(hosts, func(host mo.HostSystem) string { return host.Name })
 	}
 
-	// Largest host by cores and largest host by memory are tracked
-	// independently, which is the conservative HA reserve for
-	// heterogeneous clusters.
-	var totalCores, maxHostCores, maxHostMemory int64
-	var maxCoreHost, maxMemoryHost string
-	for _, host := range hosts {
-		if host.Summary.Hardware == nil {
-			calc.reason = "host_hardware_missing"
-			logClusterCalculation(debugLogger, calc)
-			// Incomplete hardware data (e.g. disconnected host) would make
-			// the core and available values silently wrong, so skip them
-			// entirely for this cluster instead of exporting bad numbers.
-			slog.Warn("host has no hardware summary, skipping core and available metrics",
-				"cluster", name, "host", host.Reference().Value)
-			return nil
-		}
-		cores := int64(host.Summary.Hardware.NumCpuCores)
-		if cores > maxHostCores {
-			maxHostCores = cores
-			maxCoreHost = host.Name
-		}
-		totalCores += cores
-
-		if memory := host.Summary.Hardware.MemorySize; memory > maxHostMemory {
-			maxHostMemory = memory
-			maxMemoryHost = host.Name
-		}
+	capacity, missingHardwareHost, complete := summarizeClusterHosts(hosts)
+	if !complete {
+		calc.reason = "host_hardware_missing"
+		logClusterCalculation(debugLogger, calc)
+		// Incomplete hardware data (e.g. disconnected host) would make
+		// the host-derived capacity values silently wrong, so skip them
+		// entirely for this cluster instead of exporting bad numbers.
+		slog.Warn("host has no hardware summary, skipping core, thread and available metrics",
+			"cluster", name, "host", missingHardwareHost)
+		return nil
 	}
 
-	calc.cpuCoresTotal = totalCores
-	calc.cpuReserveCores = maxHostCores
-	calc.cpuReserveHost = maxCoreHost
-	calc.cpuCoresAvailable = totalCores - maxHostCores - allocation.cpuCores
-	calc.memoryReserveBytes = maxHostMemory
-	calc.memoryReserveHost = maxMemoryHost
+	calc.cpuCoresTotal = capacity.cpuCoresTotal
+	calc.cpuReserveCores = capacity.cpuReserveCores
+	calc.cpuReserveHost = capacity.cpuReserveHost
+	calc.cpuCoresAvailable = capacity.cpuCoresTotal - capacity.cpuReserveCores - allocation.vcpus
+	calc.cpuThreadsTotal = capacity.cpuThreadsTotal
+	calc.cpuReserveThreads = capacity.cpuReserveThreads
+	calc.cpuReserveThreadHost = capacity.cpuReserveThreadHost
+	calc.cpuThreadsAvailable = capacity.cpuThreadsTotal - capacity.cpuReserveThreads - allocation.vcpus
+	calc.memoryReserveBytes = capacity.memoryReserveBytes
+	calc.memoryReserveHost = capacity.memoryReserveHost
 
-	metrics.cpuCoresTotal.WithLabelValues(name).Set(float64(totalCores))
+	metrics.cpuCoresTotal.WithLabelValues(name).Set(float64(capacity.cpuCoresTotal))
 	metrics.cpuCoresAvail.WithLabelValues(name).Set(float64(calc.cpuCoresAvailable))
+	metrics.cpuThreadsTotal.WithLabelValues(name).Set(float64(capacity.cpuThreadsTotal))
+	metrics.cpuThreadsAvail.WithLabelValues(name).Set(float64(calc.cpuThreadsAvailable))
 
 	// Available memory is derived from the same cluster summary value that is
 	// exported as the total, so both gauges stay consistent.
@@ -352,7 +378,7 @@ func collectOneCluster(ctx context.Context, viewManager *view.Manager, propColle
 		slog.Warn("cluster has no summary, skipping available memory", "cluster", name)
 		return nil
 	}
-	calc.memoryBytesAvailable = summary.TotalMemory - maxHostMemory - allocation.memoryBytes
+	calc.memoryBytesAvailable = summary.TotalMemory - capacity.memoryReserveBytes - allocation.memoryBytes
 	metrics.memoryAvail.WithLabelValues(name).Set(float64(calc.memoryBytesAvailable))
 
 	calc.complete = true
@@ -360,6 +386,40 @@ func collectOneCluster(ctx context.Context, viewManager *view.Manager, propColle
 	logClusterCalculation(debugLogger, calc)
 
 	return nil
+}
+
+// summarizeClusterHosts derives the physical-core, logical-thread and memory
+// HA reserve inputs independently. Heterogeneous clusters can have different
+// largest hosts for each resource.
+func summarizeClusterHosts(hosts []mo.HostSystem) (clusterHostCapacity, string, bool) {
+	var capacity clusterHostCapacity
+	for _, host := range hosts {
+		if host.Summary.Hardware == nil {
+			return clusterHostCapacity{}, host.Reference().Value, false
+		}
+
+		cores := int64(host.Summary.Hardware.NumCpuCores)
+		capacity.cpuCoresTotal += cores
+		if cores > capacity.cpuReserveCores {
+			capacity.cpuReserveCores = cores
+			capacity.cpuReserveHost = host.Name
+		}
+
+		threads := int64(host.Summary.Hardware.NumCpuThreads)
+		capacity.cpuThreadsTotal += threads
+		if threads > capacity.cpuReserveThreads {
+			capacity.cpuReserveThreads = threads
+			capacity.cpuReserveThreadHost = host.Name
+		}
+
+		memory := host.Summary.Hardware.MemorySize
+		if memory > capacity.memoryReserveBytes {
+			capacity.memoryReserveBytes = memory
+			capacity.memoryReserveHost = host.Name
+		}
+	}
+
+	return capacity, "", true
 }
 
 // clusterVmAllocation sums the configured vCPUs and memory (bytes) of all
@@ -398,6 +458,7 @@ func clusterVmAllocation(ctx context.Context, viewManager *view.Manager, cluster
 				"vm_ref", vm.Reference().Value,
 				"power_state", vm.Summary.Runtime.PowerState,
 				"cpu_cores", vm.Summary.Config.NumCpu,
+				"vcpus", vm.Summary.Config.NumCpu,
 				"memory_mib", vm.Summary.Config.MemorySizeMB,
 				"memory_bytes", memoryBytes,
 				"counted", counted,
@@ -409,7 +470,7 @@ func clusterVmAllocation(ctx context.Context, viewManager *view.Manager, cluster
 			continue
 		}
 		allocation.countedVMs++
-		allocation.cpuCores += int64(vm.Summary.Config.NumCpu)
+		allocation.vcpus += int64(vm.Summary.Config.NumCpu)
 		allocation.memoryBytes += memoryBytes
 	}
 	return allocation, nil
@@ -458,8 +519,13 @@ func logClusterCalculation(logger *slog.Logger, calc clusterCalculation) {
 		"cpu_cores_total", calc.cpuCoresTotal,
 		"cpu_ha_reserve_cores", calc.cpuReserveCores,
 		"cpu_ha_reserve_host", calc.cpuReserveHost,
-		"vm_cpu_cores_allocated", calc.allocation.cpuCores,
+		"vm_cpu_cores_allocated", calc.allocation.vcpus,
 		"cpu_cores_available", calc.cpuCoresAvailable,
+		"cpu_threads_total", calc.cpuThreadsTotal,
+		"cpu_ha_reserve_threads", calc.cpuReserveThreads,
+		"cpu_ha_reserve_thread_host", calc.cpuReserveThreadHost,
+		"vm_vcpus_allocated", calc.allocation.vcpus,
+		"cpu_threads_available", calc.cpuThreadsAvailable,
 		"memory_bytes_total", calc.memoryBytesTotal,
 		"memory_ha_reserve_bytes", calc.memoryReserveBytes,
 		"memory_ha_reserve_host", calc.memoryReserveHost,
