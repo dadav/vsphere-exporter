@@ -73,11 +73,14 @@ Development commands are in the `justfile` (`just test`, `just build`, `just run
 | `vcenter_cluster_vm_memory_bytes_allocated` | Sum of configured VM memory, powered-off included, SRM placeholders and excluded folders left out |
 | `vcenter_cluster_cpu_threads_available` | Logical CPU threads left after HA reserve and VM allocation |
 | `vcenter_cluster_memory_bytes_available` | Memory left after HA reserve and VM allocation |
+| `vcenter_cluster_datastore_info` | Cluster-to-datastore mapping, with a value of `1` for each relationship |
 | `vcenter_datastore_capacity_bytes` | Datastore capacity |
 | `vcenter_datastore_free_bytes` | Datastore free space |
 | `vcenter_cluster_scrape_failures_total`, `vcenter_datastore_scrape_failures_total` | Scrape error counters |
 
 Cluster metrics are labelled with `name` (cluster name), datastore metrics with `name` and `url`.
+`vcenter_cluster_datastore_info` uses `cluster`, `name`, and `url`, where `name` and `url`
+match the datastore metrics exactly.
 
 CPU metric migration: replace `vcenter_cluster_cpu_cores_total` with
 `vcenter_cluster_cpu_physical_cores_total`, `vcenter_cluster_vm_cpu_cores_allocated`
@@ -158,6 +161,17 @@ Datastore usage percentage:
 ```promql
 100 * (1 - vcenter_datastore_free_bytes / vcenter_datastore_capacity_bytes)
 ```
+
+Add the compute cluster label to datastore metrics:
+
+```promql
+vcenter_datastore_free_bytes
+  * on(name, url) group_right
+    vcenter_cluster_datastore_info
+```
+
+For a datastore shared by multiple compute clusters, this returns one series per
+cluster-datastore relationship.
 
 Alert on scrape failures:
 

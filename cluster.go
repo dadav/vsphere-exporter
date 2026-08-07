@@ -49,6 +49,12 @@ type clusterHostCapacity struct {
 	memoryReserveHost     string
 }
 
+type clusterDatastoreRelation struct {
+	clusterName   string
+	datastoreName string
+	datastoreURL  string
+}
+
 // clusterCalculation captures the inputs of the cluster capacity formulas so
 // debug mode explains exactly the numbers that were exported. Fields are filled
 // in as they are computed, so the record of an aborted calculation carries
@@ -88,6 +94,7 @@ type clusterMetrics struct {
 	vmMemory              *prometheus.GaugeVec
 	cpuThreadsAvail       *prometheus.GaugeVec
 	memoryAvail           *prometheus.GaugeVec
+	datastoreInfo         *prometheus.GaugeVec
 	scrapeFailures        prometheus.Counter
 }
 
@@ -142,6 +149,10 @@ func newClusterMetrics(reg prometheus.Registerer) *clusterMetrics {
 			Name: "vcenter_cluster_memory_bytes_available",
 			Help: "Memory left in the compute cluster in bytes after subtracting the largest host (HA reserve) and all allocated memory. May be negative on overcommit",
 		}, []string{"name"}),
+		datastoreInfo: auto.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "vcenter_cluster_datastore_info",
+			Help: "Mapping of compute clusters to accessible datastores. The value is always 1",
+		}, []string{"cluster", "name", "url"}),
 		scrapeFailures: auto.NewCounter(prometheus.CounterOpts{
 			Name: "vcenter_cluster_scrape_failures_total",
 			Help: "Number of cluster scrape failures",
@@ -208,7 +219,7 @@ func collectClusterMetricsWithDebug(ctx context.Context, client *vim25.Client, m
 	defer clusterView.Destroy(ctx)
 
 	var clusters []mo.ClusterComputeResource
-	if err := clusterView.Retrieve(ctx, []string{"ClusterComputeResource"}, []string{"name", "summary", "host"}, &clusters); err != nil {
+	if err := clusterView.Retrieve(ctx, []string{"ClusterComputeResource"}, []string{"name", "summary", "host", "datastore"}, &clusters); err != nil {
 		return fmt.Errorf("retrieving clusters: %w", err)
 	}
 	if debugLogger != nil {
@@ -217,11 +228,15 @@ func collectClusterMetricsWithDebug(ctx context.Context, client *vim25.Client, m
 
 	propCollector := property.DefaultCollector(client)
 
+	var errs []error
+	if err := collectClusterDatastoreInfo(ctx, propCollector, clusters, metrics.datastoreInfo); err != nil {
+		errs = append(errs, fmt.Errorf("collecting cluster datastore mappings: %w", err))
+	}
+
 	// Reset only after the cluster list was retrieved successfully, so a
 	// failing vCenter connection does not wipe the last known good values.
 	metrics.resetGauges()
 
-	var errs []error
 	for _, cluster := range clusters {
 		if err := collectOneCluster(ctx, viewManager, propCollector, cluster, excludedFolders, metrics, debugLogger); err != nil {
 			errs = append(errs, fmt.Errorf("cluster %q: %w", cluster.Name, err))
@@ -229,6 +244,66 @@ func collectClusterMetricsWithDebug(ctx context.Context, client *vim25.Client, m
 	}
 
 	return errors.Join(errs...)
+}
+
+// collectClusterDatastoreInfo retrieves datastore identities before replacing
+// the exported relationship snapshot. A failed retrieve therefore keeps the
+// last known good mapping while the other cluster gauges can still be updated.
+func collectClusterDatastoreInfo(ctx context.Context, propCollector *property.Collector, clusters []mo.ClusterComputeResource, metric *prometheus.GaugeVec) error {
+	uniqueRefs := make(map[types.ManagedObjectReference]struct{})
+	for _, cluster := range clusters {
+		for _, ref := range cluster.Datastore {
+			uniqueRefs[ref] = struct{}{}
+		}
+	}
+
+	if len(uniqueRefs) == 0 {
+		replaceClusterDatastoreInfo(clusters, nil, metric)
+		return nil
+	}
+
+	refs := make([]types.ManagedObjectReference, 0, len(uniqueRefs))
+	for ref := range uniqueRefs {
+		refs = append(refs, ref)
+	}
+
+	var datastores []mo.Datastore
+	if err := propCollector.Retrieve(ctx, refs, []string{"summary"}, &datastores); err != nil {
+		return fmt.Errorf("retrieving datastore summaries: %w", err)
+	}
+	replaceClusterDatastoreInfo(clusters, datastores, metric)
+	return nil
+}
+
+func replaceClusterDatastoreInfo(clusters []mo.ClusterComputeResource, datastores []mo.Datastore, metric *prometheus.GaugeVec) {
+	identities := make(map[types.ManagedObjectReference]types.DatastoreSummary, len(datastores))
+	for _, datastore := range datastores {
+		identities[datastore.Reference()] = datastore.Summary
+	}
+
+	relations := make([]clusterDatastoreRelation, 0)
+	for _, cluster := range clusters {
+		for _, ref := range cluster.Datastore {
+			summary, ok := identities[ref]
+			if !ok {
+				slog.Warn("datastore referenced by cluster was not returned, skipping mapping",
+					"cluster", cluster.Name,
+					"datastore", ref.Value,
+				)
+				continue
+			}
+			relations = append(relations, clusterDatastoreRelation{
+				clusterName:   cluster.Name,
+				datastoreName: summary.Name,
+				datastoreURL:  summary.Url,
+			})
+		}
+	}
+
+	metric.Reset()
+	for _, relation := range relations {
+		metric.WithLabelValues(relation.clusterName, relation.datastoreName, relation.datastoreURL).Set(1)
+	}
 }
 
 // resolveExcludedFolders looks up all folders whose name matches one of the

@@ -10,7 +10,9 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/vmware/govmomi/object"
+	"github.com/vmware/govmomi/property"
 	"github.com/vmware/govmomi/simulator"
+	"github.com/vmware/govmomi/view"
 	"github.com/vmware/govmomi/vim25"
 	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/types"
@@ -415,6 +417,7 @@ func TestCollectClusterMetrics(t *testing.T) {
 		}
 		expected := map[string]bool{
 			"vcenter_cluster_cpu_threads_ha_reserved":  false,
+			"vcenter_cluster_datastore_info":           false,
 			"vcenter_cluster_memory_bytes_ha_reserved": false,
 		}
 		for _, family := range families {
@@ -431,6 +434,133 @@ func TestCollectClusterMetrics(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestClusterDatastoreInfoMatchesInventory(t *testing.T) {
+	simulator.Test(func(ctx context.Context, client *vim25.Client) {
+		metrics := newClusterMetrics(prometheus.NewRegistry())
+		if err := collectClusterMetrics(ctx, client, metrics, nil); err != nil {
+			t.Fatalf("collectClusterMetrics: %v", err)
+		}
+
+		viewManager := view.NewManager(client)
+		clusterView, err := viewManager.CreateContainerView(ctx, client.ServiceContent.RootFolder, []string{"ClusterComputeResource"}, true)
+		if err != nil {
+			t.Fatalf("creating cluster view: %v", err)
+		}
+		defer clusterView.Destroy(ctx)
+
+		var clusters []mo.ClusterComputeResource
+		if err := clusterView.Retrieve(ctx, []string{"ClusterComputeResource"}, []string{"name", "datastore"}, &clusters); err != nil {
+			t.Fatalf("retrieving clusters: %v", err)
+		}
+
+		checked := 0
+		propCollector := property.DefaultCollector(client)
+		for _, cluster := range clusters {
+			var datastores []mo.Datastore
+			if err := propCollector.Retrieve(ctx, cluster.Datastore, []string{"summary"}, &datastores); err != nil {
+				t.Fatalf("retrieving datastores for cluster %q: %v", cluster.Name, err)
+			}
+			for _, datastore := range datastores {
+				checked++
+				if got := gaugeValue(t, metrics.datastoreInfo, cluster.Name, datastore.Summary.Name, datastore.Summary.Url); got != 1 {
+					t.Errorf("cluster datastore info for %q and %q = %v, want 1", cluster.Name, datastore.Summary.Name, got)
+				}
+			}
+		}
+
+		if checked == 0 {
+			t.Fatal("simulator has no cluster datastore relationships")
+		}
+	})
+}
+
+func TestClusterDatastoreInfoEmptySnapshotClearsSeries(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	metrics := newClusterMetrics(reg)
+	metrics.datastoreInfo.WithLabelValues("ghost-cluster", "ghost-datastore", "ds:///ghost").Set(1)
+
+	if err := collectClusterDatastoreInfo(context.Background(), nil, nil, metrics.datastoreInfo); err != nil {
+		t.Fatalf("collectClusterDatastoreInfo: %v", err)
+	}
+
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gathering metrics: %v", err)
+	}
+	for _, family := range families {
+		if family.GetName() == "vcenter_cluster_datastore_info" {
+			t.Error("empty relationship snapshot still exports datastore mappings")
+		}
+	}
+}
+
+func TestClusterDatastoreInfoMissingDatastoreDoesNotAbortSnapshot(t *testing.T) {
+	validRef := types.ManagedObjectReference{Type: "Datastore", Value: "datastore-1"}
+	missingRef := types.ManagedObjectReference{Type: "Datastore", Value: "datastore-deleted"}
+
+	var cluster mo.ClusterComputeResource
+	cluster.Name = "cluster-a"
+	cluster.Datastore = []types.ManagedObjectReference{validRef, missingRef}
+
+	var datastore mo.Datastore
+	datastore.Self = validRef
+	datastore.Summary = types.DatastoreSummary{Name: "shared-datastore", Url: "ds:///shared"}
+
+	reg := prometheus.NewRegistry()
+	metrics := newClusterMetrics(reg)
+	metrics.datastoreInfo.WithLabelValues("ghost-cluster", "ghost-datastore", "ds:///ghost").Set(1)
+
+	var output bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&output, nil)))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
+	replaceClusterDatastoreInfo([]mo.ClusterComputeResource{cluster}, []mo.Datastore{datastore}, metrics.datastoreInfo)
+
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gathering metrics: %v", err)
+	}
+
+	seriesCount := 0
+	validFound := false
+	for _, family := range families {
+		if family.GetName() != "vcenter_cluster_datastore_info" {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			seriesCount++
+			labels := make(map[string]string, len(metric.GetLabel()))
+			for _, label := range metric.GetLabel() {
+				labels[label.GetName()] = label.GetValue()
+			}
+			if labels["cluster"] == "cluster-a" && labels["name"] == "shared-datastore" && labels["url"] == "ds:///shared" {
+				validFound = true
+			}
+			if labels["cluster"] == "ghost-cluster" || labels["name"] == "datastore-deleted" {
+				t.Errorf("unexpected stale or missing datastore mapping: %v", labels)
+			}
+		}
+	}
+	if !validFound {
+		t.Error("valid datastore mapping was not exported")
+	}
+	if seriesCount != 1 {
+		t.Errorf("datastore mapping series count = %d, want 1", seriesCount)
+	}
+
+	logOutput := output.String()
+	for _, want := range []string{
+		"datastore referenced by cluster was not returned, skipping mapping",
+		"cluster=cluster-a",
+		"datastore=datastore-deleted",
+	} {
+		if !strings.Contains(logOutput, want) {
+			t.Errorf("warning output %q does not contain %q", logOutput, want)
+		}
+	}
 }
 
 func TestPoweredOffVmsAreCounted(t *testing.T) {
@@ -482,6 +612,7 @@ func TestStaleClusterSeriesAreDropped(t *testing.T) {
 		metrics.memoryHAReserved.WithLabelValues("ghost-cluster").Set(99)
 		metrics.vmVcpus.WithLabelValues("ghost-cluster").Set(99)
 		metrics.cpuThreadsAvail.WithLabelValues("ghost-cluster").Set(99)
+		metrics.datastoreInfo.WithLabelValues("ghost-cluster", "ghost-datastore", "ds:///ghost").Set(1)
 
 		if err := collectClusterMetrics(ctx, client, metrics, nil); err != nil {
 			t.Fatalf("collectClusterMetrics: %v", err)
@@ -494,7 +625,7 @@ func TestStaleClusterSeriesAreDropped(t *testing.T) {
 		for _, family := range families {
 			for _, metric := range family.GetMetric() {
 				for _, label := range metric.GetLabel() {
-					if label.GetName() == "name" && label.GetValue() == "ghost-cluster" {
+					if (label.GetName() == "name" || label.GetName() == "cluster") && label.GetValue() == "ghost-cluster" {
 						t.Error("stale series for removed cluster still exported")
 					}
 				}
